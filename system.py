@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Request
 
 from DataDictionaryAdminApp.config import get_settings
+from DataDictionaryAdminApp.core.database import database_connection_status
 from DataDictionaryAdminApp.utils.security import current_role, current_user
 
 router = APIRouter(tags=["System"])
@@ -8,7 +9,12 @@ router = APIRouter(tags=["System"])
 
 @router.get("/health")
 def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {
+        "status": "ok",
+        "version": "2.1.0",
+        "upload_modes": ["MERGE", "INSERT_ONLY", "REPLACE"],
+        "database_status_endpoint": True,
+    }
 
 
 @router.get("/system/context")
@@ -35,3 +41,11 @@ def context(request: Request):
         "role": role,
         "is_admin": role == "ADMIN",
     }
+
+
+@router.get("/system/database-status")
+def database_status(request: Request):
+    settings = get_settings()
+    environment = settings.resolve_environment(request.headers.get("X-App-Environment"))
+    db_type = settings.resolve_db_type(request.headers.get("X-DB-Type"))
+    return database_connection_status(environment, db_type)

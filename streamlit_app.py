@@ -12,7 +12,7 @@ import streamlit as st
 from streamlit_modal import Modal
 
 from DataDictionaryAdminApp.service.excel_service import STANDARD_FIELDS
-from DataDictionaryAdminApp.utils.normalizers import generate_physical_name, generate_tech_logic
+from DataDictionaryAdminApp.utils.normalizers import generate_physical_name, generate_tech_logic, portfolio_from_sheet_name
 
 
 def load_env() -> None:
@@ -107,6 +107,7 @@ for key, default in {
     "show_edit": False,
     "edit_unlocked": False,
     "show_finalize_confirm": False,
+    "show_soft_deleted": False,
 }.items():
     st.session_state.setdefault(key, default)
 
@@ -174,6 +175,13 @@ with st.sidebar:
 
 lookups = api("GET", "/lookups", quiet=True) or {"portfolios": [], "sources": [], "sections": [], "subsections": []}
 portfolio_labels = [item.get("label") for item in lookups.get("portfolios", []) if item.get("label")]
+bulk_portfolio_options = []
+for item in lookups.get("portfolios", []):
+    portfolio_name = str(item.get("portfolio_name") or "").strip()
+    sector_name = str(item.get("sector_name") or "").strip()
+    value = sector_name if portfolio_name.upper() == "FI" else portfolio_name
+    if value and value not in bulk_portfolio_options:
+        bulk_portfolio_options.append(value)
 source_options = [item.get("source_code") for item in lookups.get("sources", []) if item.get("source_code")]
 source_names = [item.get("source_name") for item in lookups.get("sources", []) if item.get("source_name")]
 source_by_code = {item.get("source_code"): item.get("source_name") for item in lookups.get("sources", [])}
@@ -321,10 +329,53 @@ with main_tabs[0]:
             "page_size": page_size,
         }
 
-        create_col, _ = st.columns([1.7, 6])
+        create_col, deleted_col, _ = st.columns([1.7, 2.0, 5])
         if create_col.button("Create New Attribute", type="primary", use_container_width=True):
             st.session_state["show_create"] = True
             create_modal.open()
+        if deleted_col.button(
+            "Hide Soft Deleted Records" if st.session_state.get("show_soft_deleted") else "View Soft Deleted Records",
+            use_container_width=True,
+        ):
+            st.session_state["show_soft_deleted"] = not st.session_state.get("show_soft_deleted", False)
+            st.rerun()
+
+        if st.session_state.get("show_soft_deleted"):
+            deleted_rows = api("GET", "/data-dictionary/soft-deleted", quiet=True) or []
+            st.markdown("#### Soft Deleted Records")
+            st.caption(
+                "These records are inactive in the final tables. Pending soft deletes remain in Delta until finalized."
+            )
+            if deleted_rows:
+                deleted_frame = pd.DataFrame(deleted_rows)
+                deleted_columns = [
+                    "prj_id", "prj_attribute_name", "prj_attribute_definition",
+                    "prj_physical_attribute_name", "portfolios", "sources",
+                    "section", "subsection", "is_active",
+                ]
+                st.dataframe(
+                    deleted_frame[[column for column in deleted_columns if column in deleted_frame.columns]],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=300,
+                )
+                deleted_ids = [str(row.get("prj_id")) for row in deleted_rows if row.get("prj_id")]
+                reactivate_prj = st.selectbox(
+                    "Select soft deleted attribute to reactivate",
+                    [""] + deleted_ids,
+                    key="soft_deleted_selected_prj",
+                )
+                if st.button(
+                    "Reactivate Selected Soft Deleted Record",
+                    disabled=not reactivate_prj,
+                    key="reactivate_soft_deleted",
+                ):
+                    response = api("POST", f"/data-dictionary/attributes/{reactivate_prj}/reactivate")
+                    if response:
+                        st.success("Reactivation staged. Review Delta, then Finalize and Upload.")
+            else:
+                st.info("No finalized soft deleted records found.")
+            st.divider()
 
         result = api("POST", "/data-dictionary/filter-page", json=payload, quiet=True)
         if result:
@@ -516,7 +567,10 @@ with main_tabs[0]:
     if is_admin and upload_tab is not None:
         with upload_tab:
             st.subheader("Bulk Upload: Single Sheet or Multi-Sheet Merger")
-            st.caption("Each selected sheet has its own header row, portfolio override and source-column mapping.")
+            st.caption(
+                "Each selected sheet has its own header row, data-start row, portfolio and source-column mapping. "
+                "Portfolio is auto-detected from the sheet name when possible and can be changed from the dropdown."
+            )
             uploaded = st.file_uploader("Master Dictionary Excel", type=["xlsx"], key="master_upload_file")
             if uploaded:
                 file_tuple = (uploaded.name, uploaded.getvalue(), uploaded.type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -530,19 +584,65 @@ with main_tabs[0]:
                 configs: list[dict[str, Any]] = []
                 for sheet_name in selected_sheets:
                     with st.expander(f"Mapping: {sheet_name}", expanded=True):
-                        c1, c2 = st.columns(2)
-                        header_row = c1.number_input("Header row (1-based)", min_value=1, max_value=50, value=2, step=1, key=f"header_{sheet_name}")
-                        portfolio_override = c2.selectbox("Portfolio override", [""] + portfolio_labels, key=f"port_{sheet_name}")
+                        c1, c2, c3 = st.columns(3)
+                        header_row = c1.number_input(
+                            "Header row (1-based)",
+                            min_value=1,
+                            max_value=50,
+                            value=2,
+                            step=1,
+                            key=f"header_{sheet_name}",
+                            help="Excel row containing the actual column names.",
+                        )
+                        data_start_key = f"data_start_{sheet_name}"
+                        minimum_data_row = int(header_row) + 1
+                        if data_start_key not in st.session_state:
+                            st.session_state[data_start_key] = minimum_data_row
+                        elif int(st.session_state[data_start_key]) < minimum_data_row:
+                            st.session_state[data_start_key] = minimum_data_row
+                        data_start_row = c2.number_input(
+                            "Data starts at row (1-based)",
+                            min_value=minimum_data_row,
+                            max_value=500,
+                            step=1,
+                            key=data_start_key,
+                            help="Use this to skip second/third header or explanatory rows after the selected header row.",
+                        )
+                        detected_portfolio = portfolio_from_sheet_name(sheet_name)
+                        portfolio_choices = [""] + list(bulk_portfolio_options)
+                        portfolio_index = (
+                            portfolio_choices.index(detected_portfolio)
+                            if detected_portfolio in portfolio_choices
+                            else 0
+                        )
+                        portfolio_override = c3.selectbox(
+                            "Portfolio",
+                            portfolio_choices,
+                            index=portfolio_index,
+                            key=f"port_{sheet_name}",
+                            format_func=lambda value: value or "Auto-detect from sheet name",
+                            help=(
+                                "Automatically defaults from the sheet name: e.g. 'Insurance Attribute' → Insurance, "
+                                "'Bank Attribute' → Banks. Select another value only when you want to override detection."
+                            ),
+                        )
                         preview = api(
                             "POST",
                             "/master-upload/preview-sheet",
                             files={"file": file_tuple},
-                            data={"sheet_name": sheet_name, "header_row": int(header_row)},
+                            data={
+                                "sheet_name": sheet_name,
+                                "header_row": int(header_row),
+                                "data_start_row": int(data_start_row),
+                            },
                             quiet=True,
                         )
                         mapping: dict[str, str] = {}
                         if preview:
-                            st.caption(f"Detected portfolio from sheet name: {preview.get('portfolio_detected') or 'Not detected'}")
+                            st.caption(
+                                f"Portfolio from sheet name: {preview.get('portfolio_detected') or 'Not detected'} | "
+                                f"Rows skipped after header: {preview.get('skipped_rows_after_header', 0)}"
+                            )
                             columns = [""] + preview.get("columns", [])
                             detected = preview.get("detected_mapping", {})
                             map_cols = st.columns(3)
@@ -561,10 +661,20 @@ with main_tabs[0]:
                         configs.append({
                             "sheet_name": sheet_name,
                             "header_row": int(header_row),
+                            "data_start_row": int(data_start_row),
                             "portfolio_override": portfolio_override,
                             "mapping": mapping,
                         })
-                upload_mode = st.radio("Database raw-load mode", ["MERGE", "REPLACE"], horizontal=True, help="REPLACE clears current raw/staging pending data before loading the workbook. Final tables are untouched until finalization.")
+                upload_mode = st.radio(
+                    "Database raw-load mode",
+                    ["MERGE", "INSERT_ONLY", "REPLACE"],
+                    horizontal=True,
+                    help=(
+                        "MERGE inserts new and updates matching staged/raw records. "
+                        "INSERT_ONLY skips PRJ IDs already present in raw, staging or final tables. "
+                        "REPLACE clears current raw/staging pending data before loading; final tables remain unchanged until finalization."
+                    ),
+                )
                 u1, u2 = st.columns(2)
                 if u1.button("Validate and Compare", disabled=not configs):
                     preview = api(
@@ -582,7 +692,11 @@ with main_tabs[0]:
                         data={"configurations_json": json.dumps(configs), "mode": upload_mode},
                     )
                     if result:
-                        st.success(f"Staged {result.get('staged_count', 0)} rows; rejected {result.get('rejected_count', 0)} rows.")
+                        st.success(
+                            f"Staged {result.get('staged_count', 0)} rows; "
+                            f"skipped existing {result.get('skipped_existing_count', 0)} PRJ ID(s); "
+                            f"rejected {result.get('rejected_count', 0)} rows."
+                        )
                         st.session_state["upload_preview"] = result
                 if st.session_state.get("upload_preview"):
                     st.json(st.session_state["upload_preview"])

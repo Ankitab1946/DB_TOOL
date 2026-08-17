@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import MetaData, Table, and_, delete, distinct, exists, false, func, inspect, or_, select, true
+from sqlalchemy import MetaData, Table, and_, delete, distinct, exists, func, inspect, or_, select
 from sqlalchemy.orm import Session
 
 from DataDictionaryAdminApp.model.entities import (
@@ -19,6 +19,7 @@ from DataDictionaryAdminApp.model.entities import (
     StagingBusinessRule,
 )
 from DataDictionaryAdminApp.utils.normalizers import canonical_portfolio_label
+from DataDictionaryAdminApp.utils.sqlalchemy_compat import boolean_equals
 
 
 def _json(value: Any) -> str | None:
@@ -34,7 +35,8 @@ def model_dict(obj: Any) -> dict[str, Any]:
 
 
 def portfolio_label(portfolio_name: str, sector_name: str) -> str:
-    return f"FI {sector_name}" if str(portfolio_name).upper() == "FI" else str(portfolio_name)
+    """UI label is the distinct portfolio_name + sector_name pair from the reference table."""
+    return f"{str(portfolio_name).strip()} {str(sector_name).strip()}".strip()
 
 
 class DataDictionaryRepository:
@@ -90,13 +92,40 @@ class DataDictionaryRepository:
 
     def physical_name_exists(self, physical_name: str, exclude_prj_id: str | None = None) -> bool:
         wanted = physical_name.strip().lower()
-        for model in (AttributeMaster, StagingAttributeMaster):
+        if not wanted:
+            return False
+        # Exact database checks are preferable to a Bloom filter here: they have no
+        # false positives and the staging/final tables already enforce uniqueness.
+        for model in (RawAttribute, StagingAttributeMaster, AttributeMaster):
             stmt = select(model.prj_id).where(func.lower(model.prj_physical_attribute_name) == wanted)
             if exclude_prj_id:
                 stmt = stmt.where(model.prj_id != exclude_prj_id)
             if self.db.execute(stmt.limit(1)).first():
                 return True
         return False
+
+    def physical_name_for_prj(self, prj_id: str) -> str | None:
+        """Return an existing physical name so blank bulk/UI values never overwrite it."""
+        for model in (StagingAttributeMaster, AttributeMaster, RawAttribute):
+            stmt = select(model.prj_physical_attribute_name).where(model.prj_id == prj_id)
+            if model is RawAttribute:
+                stmt = stmt.order_by(model.raw_row_id)
+            value = self.db.execute(stmt.limit(1)).scalar_one_or_none()
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
+
+    def available_physical_name(self, base_name: str, exclude_prj_id: str | None = None) -> str:
+        """Return a deterministic unique physical name based on the generated acronym."""
+        base = base_name.strip() or "attribute"
+        if not self.physical_name_exists(base, exclude_prj_id=exclude_prj_id):
+            return base
+        for suffix in range(2, 10001):
+            suffix_text = f" {suffix}"
+            candidate = f"{base[:500 - len(suffix_text)]}{suffix_text}"
+            if not self.physical_name_exists(candidate, exclude_prj_id=exclude_prj_id):
+                return candidate
+        raise ValueError(f"Could not generate a unique PRJ Physical Attribute Name from '{base}'.")
 
     def _source_table(self) -> Table | None:
         bind = self.db.get_bind()
@@ -161,18 +190,23 @@ class DataDictionaryRepository:
     def list_portfolios(self, include_inactive: bool = False) -> list[dict[str, Any]]:
         stmt = select(PortfolioReference)
         if not include_inactive:
-            stmt = stmt.where(PortfolioReference.is_active == true())
-        stmt = stmt.order_by(PortfolioReference.port_ref_id)
-        result = []
+            stmt = stmt.where(boolean_equals(PortfolioReference.is_active))
+        stmt = stmt.order_by(PortfolioReference.portfolio_name, PortfolioReference.sector_name, PortfolioReference.port_ref_id)
+        result: list[dict[str, Any]] = []
+        seen_pairs: set[tuple[str, str]] = set()
         for item in self.db.scalars(stmt).all():
             row = model_dict(item)
+            pair = (str(row["portfolio_name"]).strip().lower(), str(row["sector_name"]).strip().lower())
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
             row["label"] = portfolio_label(row["portfolio_name"], row["sector_name"])
             result.append(row)
         return result
 
     def portfolio_ref(self, portfolio: str) -> dict[str, Any] | None:
         wanted = canonical_portfolio_label(portfolio).lower()
-        return next((row for row in self.list_portfolios(False) if str(row["label"]).lower() == wanted), None)
+        return next((row for row in self.list_portfolios(True) if str(row["label"]).lower() == wanted), None)
 
     @staticmethod
     def _master_model(schema: str):
@@ -226,7 +260,7 @@ class DataDictionaryRepository:
         m = AttributeMaster
         r = AttributeBusinessRule
         if not filters.include_deleted:
-            conditions.append(m.is_active == true())
+            conditions.append(boolean_equals(m.is_active))
         if filters.prj_id:
             conditions.append(m.prj_id.ilike(f"%{filters.prj_id.strip()}%"))
         if filters.attribute_name:
@@ -235,7 +269,7 @@ class DataDictionaryRepository:
             conditions.append(m.prj_attribute_definition.ilike(f"%{filters.attribute_definition.strip()}%"))
         rule_base = [r.prj_id == m.prj_id]
         if not filters.include_deleted:
-            rule_base.append(r.is_active == true())
+            rule_base.append(boolean_equals(r.is_active))
         if filters.section:
             conditions.append(exists(select(1).where(*rule_base, r.section == filters.section)))
         if filters.subsection:
@@ -257,7 +291,7 @@ class DataDictionaryRepository:
         if filters.overlapped_only:
             scope_stmt = select(func.count(distinct(r.port_ref_id))).where(r.prj_id == m.prj_id)
             if not filters.include_deleted:
-                scope_stmt = scope_stmt.where(r.is_active == true())
+                scope_stmt = scope_stmt.where(boolean_equals(r.is_active))
             scope_count = scope_stmt.correlate(m).scalar_subquery()
             conditions.append(scope_count > 1)
         if filters.search:
@@ -319,7 +353,7 @@ class DataDictionaryRepository:
         m = AttributeMaster
         masters = list(
             self.db.scalars(
-                select(m).where(m.is_active == false()).order_by(m.prj_id)
+                select(m).where(boolean_equals(m.is_active, False)).order_by(m.prj_id)
             ).all()
         )
         if not masters:
@@ -370,7 +404,7 @@ class DataDictionaryRepository:
             .join(PortfolioReference, PortfolioReference.port_ref_id == AttributeBusinessRule.port_ref_id)
         )
         if not include_deleted:
-            stmt = stmt.where(AttributeMaster.is_active == true(), AttributeBusinessRule.is_active == true())
+            stmt = stmt.where(boolean_equals(AttributeMaster.is_active), boolean_equals(AttributeBusinessRule.is_active))
         stmt = stmt.order_by(AttributeMaster.prj_id, AttributeBusinessRule.port_ref_id, AttributeBusinessRule.display_order)
         rows = []
         for master, rule, portfolio in self.db.execute(stmt).all():
@@ -400,9 +434,9 @@ class DataDictionaryRepository:
         return rows
 
     def lookup_values(self) -> dict[str, Any]:
-        sections = list(self.db.scalars(select(distinct(AttributeBusinessRule.section)).where(AttributeBusinessRule.is_active == true()).order_by(AttributeBusinessRule.section)).all())
-        subsections = list(self.db.scalars(select(distinct(AttributeBusinessRule.subsection)).where(AttributeBusinessRule.is_active == true()).order_by(AttributeBusinessRule.subsection)).all())
-        return {"portfolios": self.list_portfolios(), "sources": self.list_sources(), "sections": sections, "subsections": subsections}
+        sections = list(self.db.scalars(select(distinct(AttributeBusinessRule.section)).where(boolean_equals(AttributeBusinessRule.is_active)).order_by(AttributeBusinessRule.section)).all())
+        subsections = list(self.db.scalars(select(distinct(AttributeBusinessRule.subsection)).where(boolean_equals(AttributeBusinessRule.is_active)).order_by(AttributeBusinessRule.subsection)).all())
+        return {"portfolios": self.list_portfolios(include_inactive=True), "sources": self.list_sources(), "sections": sections, "subsections": subsections}
 
     def original_mapping_type(self, prj_id: str) -> str | None:
         for value in self.db.scalars(
@@ -423,7 +457,7 @@ class DataDictionaryRepository:
         return list(
             self.db.scalars(
                 select(RawAttribute)
-                .where(RawAttribute.prj_id == prj_id, RawAttribute.portfolio == portfolio, RawAttribute.is_active == true())
+                .where(RawAttribute.prj_id == prj_id, RawAttribute.portfolio == portfolio, boolean_equals(RawAttribute.is_active))
                 .order_by(RawAttribute.raw_row_id)
             ).all()
         )

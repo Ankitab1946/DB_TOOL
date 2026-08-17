@@ -12,7 +12,7 @@ import streamlit as st
 from streamlit_modal import Modal
 
 from DataDictionaryAdminApp.service.excel_service import STANDARD_FIELDS
-from DataDictionaryAdminApp.utils.normalizers import generate_physical_name, generate_tech_logic, portfolio_from_sheet_name
+from DataDictionaryAdminApp.utils.normalizers import canonical_portfolio_label, generate_physical_name, generate_tech_logic, portfolio_from_sheet_name
 
 
 def load_env() -> None:
@@ -93,6 +93,48 @@ def api(method: str, path: str, *, quiet: bool = False, binary: bool = False, **
     return response if binary else response.json()
 
 
+def database_status_check() -> dict[str, Any]:
+    """Check DB connectivity through FastAPI, with a local diagnostic fallback.
+
+    The fallback is deliberately limited to ``SELECT 1`` connectivity diagnostics;
+    normal application reads/writes continue to go through FastAPI only. This also
+    gives a useful message when Streamlit has been updated but an older FastAPI
+    process is still running without the database-status endpoint.
+    """
+    api_issue = None
+    try:
+        response = HTTP.get(API + "/system/database-status", headers=headers(), timeout=READ_TIMEOUT)
+        if response.ok:
+            result = response.json()
+            result["status_source"] = "API"
+            return result
+        try:
+            detail = response.json().get("detail", response.json())
+        except Exception:
+            detail = response.text
+        api_issue = f"HTTP {response.status_code}: {detail}"
+    except requests.RequestException as exc:
+        api_issue = str(exc)
+
+    try:
+        from DataDictionaryAdminApp.core.database import database_connection_status
+
+        result = database_connection_status(
+            st.session_state.get("environment", os.getenv("SELECTED_ENVIRONMENT", "LOCAL")),
+            st.session_state.get("database_type", os.getenv("SELECTED_DB_TYPE", "SQLSERVER")),
+        )
+        result["status_source"] = "DIRECT_FALLBACK"
+        result["api_issue"] = api_issue
+        return result
+    except Exception as exc:
+        return {
+            "connected": False,
+            "issue": f"API status check failed: {api_issue or 'unknown error'}; direct database check failed: {exc}",
+            "status_source": "FAILED",
+            "api_issue": api_issue,
+        }
+
+
 for key, default in {
     "environment": os.getenv("SELECTED_ENVIRONMENT", "LOCAL"),
     "database_type": os.getenv("SELECTED_DB_TYPE", "SQLSERVER").upper(),
@@ -108,6 +150,8 @@ for key, default in {
     "edit_unlocked": False,
     "show_finalize_confirm": False,
     "show_soft_deleted": False,
+    "database_status_key": "",
+    "database_status": None,
 }.items():
     st.session_state.setdefault(key, default)
 
@@ -170,24 +214,47 @@ with st.sidebar:
     st.text_input("Server", value=str(refreshed.get("server", "Unknown")), disabled=True)
     st.text_input("Current User", value=str(refreshed.get("current_user", CURRENT_USER)), disabled=True)
     st.text_input("Access", value=str(refreshed.get("role", st.session_state.get("role", "USER"))), disabled=True)
+
+    status_key = f"{st.session_state['environment']}:{st.session_state['database_type']}"
+    if st.session_state.get("database_status_key") != status_key:
+        st.session_state["database_status"] = database_status_check()
+        st.session_state["database_status_key"] = status_key
+    if st.button("Test Database Connection", use_container_width=True):
+        st.session_state["database_status"] = database_status_check()
+    db_status = st.session_state.get("database_status")
+    selected_db_label = db_labels.get(st.session_state["database_type"], st.session_state["database_type"])
+    if db_status and db_status.get("connected"):
+        st.success(f"{selected_db_label}: Connected")
+    elif db_status:
+        st.error(f"{selected_db_label}: Not connected")
+        st.caption(str(db_status.get("issue") or "Unknown database connection error."))
+    if db_status and db_status.get("status_source") == "DIRECT_FALLBACK":
+        st.caption(
+            "Connectivity was checked directly because the FastAPI database-status endpoint was unavailable. "
+            "Restart FastAPI after replacing the latest files."
+        )
+        if db_status.get("api_issue"):
+            st.caption(f"API status issue: {db_status['api_issue']}")
+
     if not refreshed.get("database_enabled", False):
         st.warning("Database access is disabled for this environment.")
 
 lookups = api("GET", "/lookups", quiet=True) or {"portfolios": [], "sources": [], "sections": [], "subsections": []}
-portfolio_labels = [item.get("label") for item in lookups.get("portfolios", []) if item.get("label")]
-bulk_portfolio_options = []
-for item in lookups.get("portfolios", []):
-    portfolio_name = str(item.get("portfolio_name") or "").strip()
-    sector_name = str(item.get("sector_name") or "").strip()
-    value = sector_name if portfolio_name.upper() == "FI" else portfolio_name
-    if value and value not in bulk_portfolio_options:
-        bulk_portfolio_options.append(value)
-source_options = [item.get("source_code") for item in lookups.get("sources", []) if item.get("source_code")]
+portfolio_labels = list(dict.fromkeys(
+    item.get("label") for item in lookups.get("portfolios", []) if item.get("label")
+))
+bulk_portfolio_options = list(portfolio_labels)
+source_options = list(dict.fromkeys(
+    item.get("source_code") for item in lookups.get("sources", []) if item.get("source_code")
+))
 source_names = [item.get("source_name") for item in lookups.get("sources", []) if item.get("source_name")]
 source_by_code = {item.get("source_code"): item.get("source_name") for item in lookups.get("sources", [])}
 
-create_modal = Modal("Create New Attribute", key="create_attribute_modal", max_width=1050)
-edit_modal = Modal("Edit Attribute", key="edit_attribute_modal", max_width=1050)
+def source_label(code: str) -> str:
+    return f"{code}[{source_by_code.get(code, code)}]"
+
+create_modal = Modal("Create New Attribute", key="create_attribute_modal", max_width=1220)
+edit_modal = Modal("Edit Attribute", key="edit_attribute_modal", max_width=1220)
 finalize_modal = Modal("Finalize and Upload", key="finalize_modal", max_width=720)
 
 
@@ -206,22 +273,59 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     st.text_input("PRJID", value=str(prj_id), disabled=True, key=f"{prefix}_prj")
     c1, c2 = st.columns(2)
     attribute_name = c1.text_input("PRJ Attribute Name *", value=str(detail.get("prj_attribute_name") or ""), disabled=locked, key=f"{prefix}_name")
-    physical_default = str(detail.get("prj_physical_attribute_name") or "")
-    generated_physical = physical_default or (generate_physical_name(attribute_name) if attribute_name else "")
-    physical = c2.text_input("PRJ Physical Attribute Name *", value=generated_physical, disabled=locked, key=f"{prefix}_physical")
-    if attribute_name and not locked:
-        suggestion = api("GET", "/lookups/physical-name-suggestions", quiet=True, params={"attribute_name": attribute_name, "prj_id": detail.get("prj_id") or ""})
-        if suggestion:
-            alternatives = [item["name"] for item in suggestion.get("suggestions", []) if item.get("available") and item.get("name") != physical]
-            if alternatives:
-                st.caption("Alternative unique names: " + ", ".join(alternatives[:3]))
+    physical_default = str(detail.get("prj_physical_attribute_name") or "").strip()
+    physical = physical_default
+    suggestion = None
+    if attribute_name and not physical_default:
+        suggestion = api(
+            "GET",
+            "/lookups/physical-name-suggestions",
+            quiet=True,
+            params={"attribute_name": attribute_name, "prj_id": detail.get("prj_id") or str(prj_id)},
+        )
+        physical = str((suggestion or {}).get("selected") or (suggestion or {}).get("generated") or generate_physical_name(attribute_name))
+    elif attribute_name and not locked:
+        suggestion = api(
+            "GET",
+            "/lookups/physical-name-suggestions",
+            quiet=True,
+            params={"attribute_name": attribute_name, "prj_id": detail.get("prj_id") or str(prj_id)},
+        )
+
+    if detail:
+        physical = c2.text_input(
+            "PRJ Physical Attribute Name *",
+            value=physical,
+            disabled=locked,
+            key=f"{prefix}_physical",
+        )
+    else:
+        # New UI attributes are generated by the application. The backend repeats
+        # the uniqueness check before staging, so concurrent users are also safe.
+        physical_key = f"{prefix}_physical_{physical or 'blank'}"
+        c2.text_input(
+            "PRJ Physical Attribute Name *",
+            value=physical,
+            disabled=True,
+            key=physical_key,
+            help="Auto-generated from Attribute Name and checked for uniqueness across raw, staging and final tables.",
+        )
+    if suggestion and not locked:
+        alternatives = [
+            item["name"] for item in suggestion.get("suggestions", [])
+            if item.get("available") and item.get("name") != physical
+        ]
+        if alternatives:
+            st.caption("Alternative unique physical names: " + ", ".join(alternatives[:3]))
 
     c1, c2, c3 = st.columns(3)
     portfolio_default = str(rule.get("portfolio") or (portfolio_labels[0] if portfolio_labels else ""))
     p_options = list(portfolio_labels)
     if portfolio_default and portfolio_default not in p_options:
         p_options.insert(0, portfolio_default)
-    p_options = p_options or ["FI Banks"]
+    if not p_options:
+        c1.error("No portfolio values returned from dbo.prj_portfolio_reference_new_test.")
+        p_options = [""]
     p_index = p_options.index(portfolio_default) if portfolio_default in p_options else 0
     portfolio = c1.selectbox("Portfolio / Scope *", p_options, index=p_index, disabled=locked, key=f"{prefix}_portfolio")
     src_code = str(rule.get("source_abbr_name") or (source_options[0] if source_options else "SNPAR"))
@@ -230,7 +334,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         s_options.insert(0, src_code)
     s_options = s_options or ["SNPAR"]
     s_index = s_options.index(src_code) if src_code in s_options else 0
-    source_code = c2.selectbox("Source *", s_options, index=s_index, format_func=lambda code: f"{source_by_code.get(code, code)} [{code}]", disabled=locked, key=f"{prefix}_source")
+    source_code = c2.selectbox("Source *", s_options, index=s_index, format_func=source_label, disabled=locked, key=f"{prefix}_source")
     current_symbol = str(rule.get("symbol") or "Amount")
     dtype_options = ["Amount", "%", "Ratio", "actual", "Other"]
     if current_symbol not in dtype_options:
@@ -270,6 +374,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         "source_abbr_name": source_code,
         "prj_attribute_name": attribute_name,
         "prj_physical_attribute_name": physical or None,
+        "physical_name_source": "SUPPLIED" if detail else "AUTO",
         "section": section,
         "sub_section": subsection,
         "data_type": data_type,
@@ -300,7 +405,7 @@ with main_tabs[0]:
         st.subheader("View Latest")
         f1, f2, f3, f4 = st.columns(4)
         portfolios = f1.multiselect("Portfolio", portfolio_labels)
-        sources = f2.multiselect("Source", source_options, format_func=lambda code: f"{source_by_code.get(code, code)} [{code}]")
+        sources = f2.multiselect("Source", source_options, format_func=source_label)
         prj_filter = f3.text_input("PRJ_ID")
         name_filter = f4.text_input("Attribute Name")
         f1, f2, f3, f4 = st.columns(4)
@@ -609,10 +714,11 @@ with main_tabs[0]:
                             help="Use this to skip second/third header or explanatory rows after the selected header row.",
                         )
                         detected_portfolio = portfolio_from_sheet_name(sheet_name)
+                        detected_portfolio_label = canonical_portfolio_label(detected_portfolio) if detected_portfolio else ""
                         portfolio_choices = [""] + list(bulk_portfolio_options)
                         portfolio_index = (
-                            portfolio_choices.index(detected_portfolio)
-                            if detected_portfolio in portfolio_choices
+                            portfolio_choices.index(detected_portfolio_label)
+                            if detected_portfolio_label in portfolio_choices
                             else 0
                         )
                         portfolio_override = c3.selectbox(
@@ -622,8 +728,8 @@ with main_tabs[0]:
                             key=f"port_{sheet_name}",
                             format_func=lambda value: value or "Auto-detect from sheet name",
                             help=(
-                                "Automatically defaults from the sheet name: e.g. 'Insurance Attribute' → Insurance, "
-                                "'Bank Attribute' → Banks. Select another value only when you want to override detection."
+                                "Automatically defaults from the sheet name: e.g. 'Insurance Attribute' → FI Insurance, "
+                                "'Bank Attribute' → FI Banks. Select another value only when you want to override detection."
                             ),
                         )
                         preview = api(
@@ -675,8 +781,19 @@ with main_tabs[0]:
                         "REPLACE clears current raw/staging pending data before loading; final tables remain unchanged until finalization."
                     ),
                 )
+                backend_health = api("GET", "/health", quiet=True) or {}
+                backend_modes = backend_health.get("upload_modes") or []
+                backend_supports_current_mode = upload_mode in backend_modes
+                if backend_health and not backend_supports_current_mode:
+                    st.error(
+                        "The FastAPI process is running an older application build and does not advertise support for "
+                        f"{upload_mode}. Restart FastAPI using the latest project files before validating or staging."
+                    )
                 u1, u2 = st.columns(2)
-                if u1.button("Validate and Compare", disabled=not configs):
+                if u1.button(
+                    "Validate and Compare",
+                    disabled=not configs or (bool(backend_health) and not backend_supports_current_mode),
+                ):
                     preview = api(
                         "POST",
                         "/master-upload/preview",
@@ -684,7 +801,15 @@ with main_tabs[0]:
                         data={"configurations_json": json.dumps(configs), "mode": upload_mode},
                     )
                     st.session_state["upload_preview"] = preview
-                if u2.button("Stage Uploaded Data", type="primary", disabled=not configs or not refreshed.get("is_admin")):
+                if u2.button(
+                    "Stage Uploaded Data",
+                    type="primary",
+                    disabled=(
+                        not configs
+                        or not refreshed.get("is_admin")
+                        or (bool(backend_health) and not backend_supports_current_mode)
+                    ),
+                ):
                     result = api(
                         "POST",
                         "/master-upload/finalize",
@@ -804,7 +929,12 @@ if st.session_state.get("show_create"):
             if payload:
                 result = api("POST", "/data-dictionary/attributes", json=payload)
                 if result:
-                    st.success(f"{result.get('prj_id')} staged successfully.")
+                    staged_tables = ", ".join(result.get("staged_tables", []))
+                    st.success(
+                        f"{result.get('prj_id')} staged successfully. "
+                        f"Physical name: {result.get('prj_physical_attribute_name')}. "
+                        f"Saved to: {staged_tables}"
+                    )
                     st.session_state["show_create"] = False
                     create_modal.close()
                     st.rerun()

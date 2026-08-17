@@ -1,0 +1,50 @@
+1) When BULK Upload What is Portfolio Override? 2) portfolio is a drop down When tab name is like 'Insurance Attribute' the portfolio should be 'Insurance, when tab name is like 'Bank Attribute' then portfolio should be 'Banks' 3) When upload excel there mostly first two/three rows are header, in case I select Header row as 1 then actually data row is starting from either row 3 or row 4 . so in this case 2nd header row is getting inserted, Application should have functionality to skip row or data row starting point. 4) Database raw-load mode should also have Insert-Only as well along with Merge and Replace 5) View Soft delete record is not appearing. 6) Validate and compare is giving me error : API error 422: Incorrect
+
+src/DataDictionaryAdminApp/streamlit_app.py
+src/DataDictionaryAdminApp/api/routers/data_dictionary.py
+src/DataDictionaryAdminApp/api/routers/master_upload.py
+src/DataDictionaryAdminApp/repositories/data_dictionary_repository.py
+src/DataDictionaryAdminApp/service/data_dictionary_service.py
+src/DataDictionaryAdminApp/service/excel_service.py
+
+Test/documentation files also changed or were added:
+
+tests/test_excel_service.py
+tests/test_normalizers.py
+tests/test_role_and_ui_contract.py
+tests/test_swagger_routes.py
+tests/test_sqlserver_boolean_contract.py — new
+tests/test_upload_modes.py — new
+VALIDATION_RESULTS.md
+
+
+  Fix following changes and errors:
+1)	When user select ‘Postgres’ application should tell user if it is connected or not, if not what is the issue? 
+2)	When adding new Attribute, page open is a bit small, page size should be decent not too big not too small. 
+3)	Currently Portfolio is appearing only FI Banks. All distinct values should appear in dropdown from Table dbo.prj_portfolio_reference_new_test in this table there are following columns : portfolio_name and sector_name 
+In dropdown value should populate distinct value of portfolio_name sector_name 
+Fro e.g. FI Banks, FI Insurance, Corporate Corporate, UKC UKC 
+4)	Source Dropwdown is populating SNPR[SNPR] , Dropdown should be populate from  
+Table : dbo.prj_data_sources , dropdown should populate as :  
+• source_code[source_name] In DB only  source_code should get saved. 
+5)	When Clicking on Create Attribute, Data should be saved in staging tables.if require make a staging table for [raw_prj_attribute_new_test] as well to maintain data. Currently getting error : API error 500: Internal server error 
+6)	PRJ Physical Attribute Name should be auto-populate ,  
+Should be Auto generated - Short acronym based on Attribute name  
+• In case of Ul entry it should check for duplicates, also give suggestions for names, see the feasibility of BLOOM filter could apply here In case of BULK upload it should be mapped with column "prj Physical Attribute Name' 
+• For e.g. Land & Buildings(Gross) should get generated as 'gross land bldgs" 
+• should be unique and Insert Only if field is blank/New 
+• Note: if there is any data while bulk upload from excel, it should pick from excel 
+• |Else can create new, also if data already there then do nothing if blank in db then create new 
+• Else can create new, also if data already there then do nothing if blank in db then create new 
+Make sure rest of the functionality remain intack and there should not be any syntax error
+
+
+
+src/DataDictionaryAdminApp/streamlit_app.py
+src/DataDictionaryAdminApp/api/routers/system.py
+src/DataDictionaryAdminApp/api/schemas_api.py
+src/DataDictionaryAdminApp/core/database.py
+src/DataDictionaryAdminApp/repositories/data_dictionary_repository.py
+src/DataDictionaryAdminApp/service/data_dictionary_service.py
+src/DataDictionaryAdminApp/service/excel_service.py
+src/DataDictionaryAdminApp/utils/normalizers.py

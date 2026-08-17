@@ -20,6 +20,10 @@ def filter_page(payload: FilterRequest, db: Session = Depends(get_db)):
 def edit_latest(include_deleted: bool = True, db: Session = Depends(get_db)):
     return DataDictionaryService(db).editable_rows(include_deleted=include_deleted)
 
+@router.get("/soft-deleted")
+def soft_deleted(db: Session = Depends(get_db)):
+    return DataDictionaryService(db).soft_deleted_rows()
+
 @router.get("/attributes/{prj_id}")
 def detail(prj_id: str, db: Session = Depends(get_db)):
     return DataDictionaryService(db).detail(prj_id)

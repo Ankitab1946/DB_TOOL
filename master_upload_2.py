@@ -14,6 +14,7 @@ from DataDictionaryAdminApp.service.excel_service import ExcelService
 from DataDictionaryAdminApp.utils.security import require_admin
 
 router = APIRouter(prefix="/master-upload", tags=["Master Dictionary Upload"])
+SUPPORTED_UPLOAD_MODES = ("MERGE", "INSERT_ONLY", "REPLACE")
 
 
 async def _content(file: UploadFile) -> bytes:
@@ -24,8 +25,10 @@ async def _content(file: UploadFile) -> bytes:
 
 
 def _mode(value: str) -> str:
-    normalized = value.strip().upper()
-    if normalized not in {"MERGE", "INSERT_ONLY", "REPLACE"}:
+    normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+    if normalized == "INSERTONLY":
+        normalized = "INSERT_ONLY"
+    if normalized not in SUPPORTED_UPLOAD_MODES:
         raise HTTPException(status_code=422, detail="mode must be MERGE, INSERT_ONLY or REPLACE")
     return normalized
 

@@ -130,8 +130,6 @@ async def upload_and_stage(
 
     repo = DataDictionaryRepository(db)
     service = DataDictionaryService(db)
-    staged: list[dict] = []
-    runtime_rejected = list(parsed["rejected"])
     rows_to_stage = parsed["rows"]
     skipped_existing_ids: list[str] = []
     if normalized_mode == "INSERT_ONLY":
@@ -148,45 +146,42 @@ async def upload_and_stage(
     try:
         if normalized_mode == "REPLACE":
             repo.clear_raw_and_staging_for_replace(user)
+            # clear_raw_and_staging_for_replace issues bulk DELETEs; flush them before
+            # the high-throughput preload so the caches reflect the replacement state.
+            db.flush()
 
-        for row in rows_to_stage:
-            try:
-                with db.begin_nested():
-                    staged.append(service.stage_attribute_pending(row, user, f"BULK_{normalized_mode}"))
-            except HTTPException as exc:
-                runtime_rejected.append({"prj_id": row.prj_id, "reason": exc.detail})
-            except IntegrityError as exc:
-                runtime_rejected.append({"prj_id": row.prj_id, "reason": str(exc.orig)})
-
-        if normalized_mode == "REPLACE" and runtime_rejected:
-            db.rollback()
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": "REPLACE was rolled back because one or more rows could not be staged.",
-                    "rejected": runtime_rejected,
-                },
-            )
+        # High-throughput staging: fixed preload queries, no per-row SAVEPOINT, and
+        # one identity flush for new raw/business-rule rows. Final master/rule tables
+        # are not touched here; publication happens only in /data-dictionary/finalize.
+        staged = service.stage_bulk_pending(rows_to_stage, user, f"BULK_{normalized_mode}")
 
         if normalized_mode == "REPLACE":
             uploaded_ids = {str(row.prj_id) for row in parsed["rows"] if row.prj_id}
-            final_active_ids = {row["prj_id"] for row in repo.editable_rows(include_deleted=False)}
+            final_active_ids = repo.active_final_prj_ids()
             for prj_id in sorted(final_active_ids - uploaded_ids):
                 repo.stage_delete_attribute(prj_id, False, user, "BULK_REPLACE_MISSING")
 
         db.commit()
     except HTTPException:
-        raise
-    except Exception:
         db.rollback()
         raise
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"Bulk staging constraint failed: {exc.orig}") from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=f"Bulk staging failed and was rolled back: {exc}") from exc
 
+    # Deliberately do not recalculate the full Delta here. That comparison is already
+    # available from Validate & Compare and can be refreshed separately on Finalize.
+    # Avoiding it makes Stage Uploaded Data return immediately after the DB commit.
     return {
         "mode": normalized_mode,
         "staged_count": len(staged),
         "skipped_existing_count": len(skipped_existing_ids),
         "skipped_existing_prj_ids": skipped_existing_ids,
-        "rejected_count": len(runtime_rejected),
-        "rejected": runtime_rejected,
-        "delta": service.delta(),
+        "rejected_count": len(parsed["rejected"]),
+        "rejected": parsed["rejected"],
+        "final_tables_updated": False,
+        "message": "Upload staged successfully. Final dbo tables remain unchanged until Finalize and Upload.",
     }

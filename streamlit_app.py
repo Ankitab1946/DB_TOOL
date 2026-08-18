@@ -126,6 +126,34 @@ def request_prj_filter_submit() -> None:
     request_filter_submit()
 
 
+VIEW_FILTER_WIDGET_KEYS = (
+    "view_portfolio_filter",
+    "view_source_filter",
+    "view_prj_id_filter",
+    "view_attribute_name_filter",
+    "view_attribute_definition_filter",
+    "view_section_filter",
+    "view_subsection_filter",
+    "view_overlapped_filter",
+    "view_include_inactive_filter",
+    "view_page_size_filter",
+    "view_page_number_filter",
+    "view_search_filter",
+)
+
+
+def clear_view_filters() -> None:
+    """Clear every View Latest filter in one action and refresh the grid."""
+    for key in VIEW_FILTER_WIDGET_KEYS:
+        st.session_state.pop(key, None)
+    st.session_state["view_rows"] = []
+    st.session_state["view_total"] = 0
+    st.session_state["view_filter_signature"] = ""
+    st.session_state["view_loaded"] = False
+    st.session_state["prj_filter_submit_requested"] = False
+    st.session_state["filter_submit_requested"] = True
+
+
 def database_status_check() -> dict[str, Any]:
     """Check DB connectivity through FastAPI, with a local diagnostic fallback.
 
@@ -344,13 +372,13 @@ create_modal = StateAwareModal(
     "Create New Attribute",
     key="create_attribute_modal",
     state_flag="show_create",
-    max_width=1780,
+    max_width=1900,
 )
 edit_modal = StateAwareModal(
     "Edit Attribute",
     key="edit_attribute_modal",
     state_flag="show_edit",
-    max_width=1780,
+    max_width=1900,
 )
 finalize_modal = Modal("Finalize and Upload", key="finalize_modal", max_width=720)
 cleanup_modal = Modal("Cleanup Database", key="cleanup_database_modal", max_width=980)
@@ -368,28 +396,28 @@ def render_attribute_modal_style(modal_key: str) -> None:
         f"""
 <style>
 div[data-modal-container='true'][key='{modal_key}'] {{
-    top: 0 !important;
-    bottom: 0 !important;
-    left: 0 !important;
+    position: fixed !important;
+    inset: 0 !important;
     width: 100vw !important;
     height: 100vh !important;
     min-height: 100vh !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
+    display: grid !important;
+    place-items: center !important;
     overflow: hidden !important;
 }}
 div[data-modal-container='true'][key='{modal_key}'] > div:first-child {{
-    width: 94vw !important;
-    max-width: 1780px !important;
-    margin: 0 auto !important;
+    width: 96vw !important;
+    max-width: 1900px !important;
+    margin: 0 !important;
+    align-self: center !important;
+    justify-self: center !important;
 }}
 div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child {{
     margin-top: 0 !important;
     margin-bottom: 0 !important;
 }}
 div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child > div:first-child {{
-    max-height: 88vh !important;
+    max-height: 90vh !important;
     overflow-y: auto !important;
     overflow-x: hidden !important;
 }}
@@ -573,9 +601,9 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
             height=145,
             key=tech_key,
             help=(
-                "Auto-populated from Calculation Logic. Example: "
-                "Total Income(PRJ362) = EBITDA(PRJ43843) - Debt(PRJ4343) "
-                "becomes PRJ362 = PRJ43843-PRJ4343. You can adjust it before saving."
+                "Auto-populated from Calculation Logic and preserves calculation brackets. "
+                "Examples: EBITDA(PRJ43843) / Debt(PRJ4343) and EBITDA(PRJ43843) /Debt/Amount(PRJ4343) "
+                "both retain the intended division operator between PRJ references. You can adjust it before saving."
             ),
         )
         examples = st.text_area(
@@ -654,7 +682,15 @@ with main_tabs[0]:
     finalize_tab = workflow_tabs[2] if is_admin else workflow_tabs[1]
 
     with view_edit_tab:
-        st.subheader("View Latest")
+        title_col, clear_col = st.columns([6, 1.4])
+        title_col.subheader("View Latest")
+        clear_col.button(
+            "Clear Filters",
+            key="clear_view_filters",
+            width="stretch",
+            on_click=clear_view_filters,
+            help="Clear all View Latest filters and reload the active grid.",
+        )
         f1, f2, f3, f4 = st.columns(4)
         portfolios = f1.multiselect(
             "Portfolio",
@@ -885,8 +921,9 @@ with main_tabs[0]:
 
         if rows:
             grid_columns = [
-                "prj_id", "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name",
-                "editable", "symbol", "portfolios", "sources", "section", "subsection", "is_active",
+                "scope_id", "prj_id", "prj_attribute_name", "prj_attribute_definition",
+                "prj_physical_attribute_name", "editable", "symbol", "portfolios", "sources",
+                "section", "subsection", "display_order", "is_active",
             ]
             frame = pd.DataFrame(rows)
             visible_frame = frame[[c for c in grid_columns if c in frame.columns]].reset_index(drop=True)
@@ -911,6 +948,12 @@ with main_tabs[0]:
                 if detail:
                     st.session_state["selected_prj"] = selected_prj
                     st.session_state["edit_detail"] = detail
+                    selected_scope_id = selected_row.get("scope_id") if selected_row else None
+                    if selected_scope_id is not None:
+                        for index, rule_row in enumerate(detail.get("rules") or []):
+                            if str(rule_row.get("scope_id")) == str(selected_scope_id):
+                                st.session_state["edit_rule"] = index
+                                break
                     st.session_state["show_edit"] = True
                     st.session_state["edit_unlocked"] = True
                     edit_modal.open()

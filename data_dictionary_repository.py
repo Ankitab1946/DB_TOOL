@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import MetaData, Table, and_, delete, distinct, exists, func, inspect, or_, select
+from sqlalchemy import MetaData, Table, and_, delete, distinct, exists, false, func, inspect, or_, select, true
 from sqlalchemy.orm import Session
 
 from DataDictionaryAdminApp.model.entities import (
@@ -18,8 +18,7 @@ from DataDictionaryAdminApp.model.entities import (
     StagingAttributeMaster,
     StagingBusinessRule,
 )
-from DataDictionaryAdminApp.utils.normalizers import canonical_portfolio_label
-from DataDictionaryAdminApp.utils.sqlalchemy_compat import boolean_equals
+from DataDictionaryAdminApp.utils.normalizers import canonical_portfolio_label, split_pipe_values
 
 
 def _json(value: Any) -> str | None:
@@ -40,6 +39,10 @@ def portfolio_label(portfolio_name: str, sector_name: str) -> str:
 
 
 class DataDictionaryRepository:
+    # Reflection of the read-only source table is expensive on SQL Server. Cache
+    # it per SQLAlchemy Engine for the lifetime of the API process.
+    _source_table_cache: dict[int, Table | None] = {}
+
     def __init__(self, db: Session):
         self.db = db
 
@@ -129,11 +132,17 @@ class DataDictionaryRepository:
 
     def _source_table(self) -> Table | None:
         bind = self.db.get_bind()
+        cache_key = id(bind)
+        if cache_key in self._source_table_cache:
+            return self._source_table_cache[cache_key]
         inspector = inspect(bind)
+        table: Table | None = None
         for name in ("prj_data_sources", "prj_data_source"):
             if inspector.has_table(name, schema="dbo"):
-                return Table(name, MetaData(), schema="dbo", autoload_with=bind)
-        return None
+                table = Table(name, MetaData(), schema="dbo", autoload_with=bind)
+                break
+        self._source_table_cache[cache_key] = table
+        return table
 
     def source_table_name(self) -> str | None:
         table = self._source_table()
@@ -190,7 +199,7 @@ class DataDictionaryRepository:
     def list_portfolios(self, include_inactive: bool = False) -> list[dict[str, Any]]:
         stmt = select(PortfolioReference)
         if not include_inactive:
-            stmt = stmt.where(boolean_equals(PortfolioReference.is_active))
+            stmt = stmt.where(PortfolioReference.is_active == true())
         stmt = stmt.order_by(PortfolioReference.portfolio_name, PortfolioReference.sector_name, PortfolioReference.port_ref_id)
         result: list[dict[str, Any]] = []
         seen_pairs: set[tuple[str, str]] = set()
@@ -249,18 +258,109 @@ class DataDictionaryRepository:
             result.append(row)
         return result
 
+    def preload_state(
+        self, prj_ids: set[str], schema: str = "dbo"
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        """Fetch master/rule state for many PRJ IDs in two queries."""
+        if not prj_ids:
+            return {}, {}
+        master_model = self._master_model(schema)
+        rule_model = self._rule_model(schema)
+        masters = {
+            item.prj_id: model_dict(item)
+            for item in self.db.scalars(select(master_model).where(master_model.prj_id.in_(prj_ids))).all()
+        }
+        rules: dict[str, list[dict[str, Any]]] = {prj_id: [] for prj_id in prj_ids}
+        for item in self.db.scalars(
+            select(rule_model)
+            .where(rule_model.prj_id.in_(prj_ids))
+            .order_by(rule_model.prj_id, rule_model.port_ref_id, rule_model.display_order, rule_model.scope_id)
+        ).all():
+            rules.setdefault(item.prj_id, []).append(model_dict(item))
+        return masters, rules
+
+    def preload_final_state(self, prj_ids: set[str]) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        return self.preload_state(prj_ids, "dbo")
+
+    def preload_original_mapping_types(self, prj_ids: set[str]) -> dict[str, str | None]:
+        result: dict[str, str | None] = {prj_id: None for prj_id in prj_ids}
+        if not prj_ids:
+            return result
+        for prj_id, value in self.db.execute(
+            select(AttributeBusinessRule.prj_id, AttributeBusinessRule.mapping_type)
+            .where(AttributeBusinessRule.prj_id.in_(prj_ids))
+            .order_by(AttributeBusinessRule.prj_id, AttributeBusinessRule.scope_id)
+        ).all():
+            if result.get(prj_id) is None and str(value or "").strip().lower() != "repeated":
+                result[prj_id] = str(value)
+        unresolved = {key for key, value in result.items() if value is None}
+        if unresolved:
+            for prj_id, value in self.db.execute(
+                select(RawAttribute.prj_id, RawAttribute.calculated_or_reported)
+                .where(RawAttribute.prj_id.in_(unresolved))
+                .order_by(RawAttribute.prj_id, RawAttribute.raw_row_id)
+            ).all():
+                if result.get(prj_id) is None and str(value or "").strip().lower() != "repeated":
+                    result[prj_id] = str(value)
+        return result
+
+    def preload_physical_names(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Return (name->owner PRJ, PRJ->preferred name) in three compact queries."""
+        owners: dict[str, str] = {}
+        by_prj: dict[str, str] = {}
+        for model in (StagingAttributeMaster, AttributeMaster, RawAttribute):
+            stmt = select(model.prj_id, model.prj_physical_attribute_name)
+            if model is RawAttribute:
+                stmt = stmt.order_by(model.raw_row_id)
+            for prj_id, value in self.db.execute(stmt).all():
+                name = str(value or "").strip()
+                if not name:
+                    continue
+                owners.setdefault(name.casefold(), str(prj_id))
+                by_prj.setdefault(str(prj_id), name)
+        return owners, by_prj
+
     def final_detail(self, prj_id: str) -> dict[str, Any] | None:
         master = self.get_master(prj_id, "dbo")
         if master:
             master["rules"] = self.get_rules(prj_id, "dbo")
         return master
 
+    def working_detail(self, prj_id: str) -> dict[str, Any] | None:
+        """Return the staged version when present, otherwise the finalized version.
+
+        Create/Edit operations are staging-first. Returning staged state here makes
+        a just-saved edit immediately visible when the modal is reopened, without
+        publishing anything to the final dbo tables before Finalize.
+        """
+        master = self.get_master(prj_id, "stg")
+        if master:
+            master["rules"] = self.get_rules(prj_id, "stg")
+            master["data_state"] = "STAGED"
+            return master
+        master = self.final_detail(prj_id)
+        if master:
+            master["data_state"] = "FINAL"
+        return master
+
+    @staticmethod
+    def _pipe_token_condition(column: Any, value: str):
+        """Match one token inside a normalized pipe-separated DB column."""
+        wanted = str(value or "").strip().lower()
+        lowered = func.lower(column)
+        return or_(
+            lowered == wanted,
+            lowered.like(f"{wanted}|%"),
+            lowered.like(f"%|{wanted}|%"),
+            lowered.like(f"%|{wanted}"),
+        )
+
     def filter_final(self, filters: Any, page_size: int) -> dict[str, Any]:
         conditions = []
         m = AttributeMaster
         r = AttributeBusinessRule
         if not filters.include_deleted:
-            conditions.append(boolean_equals(m.is_active))
+            conditions.append(m.is_active == true())
         if filters.prj_id:
             conditions.append(m.prj_id.ilike(f"%{filters.prj_id.strip()}%"))
         if filters.attribute_name:
@@ -269,11 +369,11 @@ class DataDictionaryRepository:
             conditions.append(m.prj_attribute_definition.ilike(f"%{filters.attribute_definition.strip()}%"))
         rule_base = [r.prj_id == m.prj_id]
         if not filters.include_deleted:
-            rule_base.append(boolean_equals(r.is_active))
+            rule_base.append(r.is_active == true())
         if filters.section:
-            conditions.append(exists(select(1).where(*rule_base, r.section == filters.section)))
+            conditions.append(exists(select(1).where(*rule_base, self._pipe_token_condition(r.section, filters.section))))
         if filters.subsection:
-            conditions.append(exists(select(1).where(*rule_base, r.subsection == filters.subsection)))
+            conditions.append(exists(select(1).where(*rule_base, self._pipe_token_condition(r.subsection, filters.subsection))))
         if filters.portfolios:
             port_ref_ids = []
             for portfolio in filters.portfolios:
@@ -291,7 +391,7 @@ class DataDictionaryRepository:
         if filters.overlapped_only:
             scope_stmt = select(func.count(distinct(r.port_ref_id))).where(r.prj_id == m.prj_id)
             if not filters.include_deleted:
-                scope_stmt = scope_stmt.where(boolean_equals(r.is_active))
+                scope_stmt = scope_stmt.where(r.is_active == true())
             scope_count = scope_stmt.correlate(m).scalar_subquery()
             conditions.append(scope_count > 1)
         if filters.search:
@@ -353,7 +453,7 @@ class DataDictionaryRepository:
         m = AttributeMaster
         masters = list(
             self.db.scalars(
-                select(m).where(boolean_equals(m.is_active, False)).order_by(m.prj_id)
+                select(m).where(m.is_active == false()).order_by(m.prj_id)
             ).all()
         )
         if not masters:
@@ -397,6 +497,16 @@ class DataDictionaryRepository:
             rows.append(item)
         return rows
 
+    def active_final_prj_ids(self) -> set[str]:
+        """Return active finalized IDs without joining business-rule rows."""
+        return {
+            str(value)
+            for value in self.db.scalars(
+                select(AttributeMaster.prj_id).where(AttributeMaster.is_active == true())
+            ).all()
+            if value is not None
+        }
+
     def editable_rows(self, include_deleted: bool = True) -> list[dict[str, Any]]:
         stmt = (
             select(AttributeMaster, AttributeBusinessRule, PortfolioReference)
@@ -404,7 +514,7 @@ class DataDictionaryRepository:
             .join(PortfolioReference, PortfolioReference.port_ref_id == AttributeBusinessRule.port_ref_id)
         )
         if not include_deleted:
-            stmt = stmt.where(boolean_equals(AttributeMaster.is_active), boolean_equals(AttributeBusinessRule.is_active))
+            stmt = stmt.where(AttributeMaster.is_active == true(), AttributeBusinessRule.is_active == true())
         stmt = stmt.order_by(AttributeMaster.prj_id, AttributeBusinessRule.port_ref_id, AttributeBusinessRule.display_order)
         rows = []
         for master, rule, portfolio in self.db.execute(stmt).all():
@@ -434,9 +544,30 @@ class DataDictionaryRepository:
         return rows
 
     def lookup_values(self) -> dict[str, Any]:
-        sections = list(self.db.scalars(select(distinct(AttributeBusinessRule.section)).where(boolean_equals(AttributeBusinessRule.is_active)).order_by(AttributeBusinessRule.section)).all())
-        subsections = list(self.db.scalars(select(distinct(AttributeBusinessRule.subsection)).where(boolean_equals(AttributeBusinessRule.is_active)).order_by(AttributeBusinessRule.subsection)).all())
-        return {"portfolios": self.list_portfolios(include_inactive=True), "sources": self.list_sources(), "sections": sections, "subsections": subsections}
+        section_values = list(
+            self.db.scalars(
+                select(distinct(AttributeBusinessRule.section))
+                .where(AttributeBusinessRule.is_active == true())
+                .order_by(AttributeBusinessRule.section)
+            ).all()
+        )
+        subsection_values = list(
+            self.db.scalars(
+                select(distinct(AttributeBusinessRule.subsection))
+                .where(AttributeBusinessRule.is_active == true())
+                .order_by(AttributeBusinessRule.subsection)
+            ).all()
+        )
+        # Section/Sub-Section can contain multiple pipe-separated values. Expose
+        # each token independently in filters rather than one combined label.
+        sections = sorted({item for value in section_values for item in split_pipe_values(value)}, key=str.casefold)
+        subsections = sorted({item for value in subsection_values for item in split_pipe_values(value)}, key=str.casefold)
+        return {
+            "portfolios": self.list_portfolios(include_inactive=True),
+            "sources": self.list_sources(),
+            "sections": sections,
+            "subsections": subsections,
+        }
 
     def original_mapping_type(self, prj_id: str) -> str | None:
         for value in self.db.scalars(
@@ -457,12 +588,185 @@ class DataDictionaryRepository:
         return list(
             self.db.scalars(
                 select(RawAttribute)
-                .where(RawAttribute.prj_id == prj_id, RawAttribute.portfolio == portfolio, boolean_equals(RawAttribute.is_active))
+                .where(RawAttribute.prj_id == prj_id, RawAttribute.portfolio == portfolio, RawAttribute.is_active == true())
                 .order_by(RawAttribute.raw_row_id)
             ).all()
         )
 
-    def upsert_raw(self, row: dict[str, Any], user: str, source_operation: str) -> None:
+    def preload_pending_objects(self, prj_ids: set[str]) -> dict[str, Any]:
+        """Load raw/staging ORM objects in three queries for fast bulk staging.
+
+        The returned dictionaries are mutable caches. Newly-created ORM objects are
+        appended to them by the cached upsert methods, so repeated rows/scopes in one
+        workbook do not require another database round trip.
+        """
+        raw_by_scope: dict[tuple[str, str], list[RawAttribute]] = {}
+        masters: dict[str, StagingAttributeMaster] = {}
+        rules_by_scope: dict[tuple[str, int], list[StagingBusinessRule]] = {}
+        if not prj_ids:
+            return {"raw": raw_by_scope, "masters": masters, "rules": rules_by_scope}
+
+        for item in self.db.scalars(
+            select(RawAttribute)
+            .where(RawAttribute.prj_id.in_(prj_ids), RawAttribute.is_active == true())
+            .order_by(RawAttribute.prj_id, RawAttribute.portfolio, RawAttribute.raw_row_id)
+        ).all():
+            raw_by_scope.setdefault((str(item.prj_id), str(item.portfolio)), []).append(item)
+
+        for item in self.db.scalars(
+            select(StagingAttributeMaster).where(StagingAttributeMaster.prj_id.in_(prj_ids))
+        ).all():
+            masters[str(item.prj_id)] = item
+
+        for item in self.db.scalars(
+            select(StagingBusinessRule)
+            .where(StagingBusinessRule.prj_id.in_(prj_ids))
+            .order_by(StagingBusinessRule.prj_id, StagingBusinessRule.port_ref_id, StagingBusinessRule.scope_id)
+        ).all():
+            rules_by_scope.setdefault((str(item.prj_id), int(item.port_ref_id)), []).append(item)
+
+        return {"raw": raw_by_scope, "masters": masters, "rules": rules_by_scope}
+
+    def upsert_raw_cached(
+        self,
+        row: dict[str, Any],
+        user: str,
+        source_operation: str,
+        cache: dict[tuple[str, str], list[RawAttribute]],
+    ) -> dict[str, Any] | None:
+        key = (str(row["prj_id"]), str(row["portfolio"]))
+        existing = cache.setdefault(key, [])
+        target = next(
+            (
+                item for item in existing
+                if int(item.display_order) == int(row["display_order"])
+                and item.section == row["section"]
+                and item.sub_section == row["sub_section"]
+            ),
+            None,
+        )
+        if target is None and len(existing) == 1 and not source_operation.upper().startswith("BULK_"):
+            target = existing[0]
+        if target is None and len(existing) > 1 and not source_operation.upper().startswith("BULK_"):
+            raise ValueError(
+                f"Cannot unambiguously update raw row for {row['prj_id']} / {row['portfolio']}; "
+                "multiple raw rows exist and the edited key no longer matches."
+            )
+        if target:
+            before = model_dict(target)
+            for field, value in row.items():
+                setattr(target, field, value)
+            target.is_active = True
+            target.updated_at = datetime.utcnow()
+            target.updated_by = user
+            # A duplicate row later in the same workbook can match an ORM object
+            # that has not received its identity value yet. Its deferred INSERT
+            # audit already captures the final in-memory state, so do not emit an
+            # UPDATE audit with record_key=None.
+            if target.raw_row_id is not None:
+                self.audit("dbo", "raw_prj_attribute_new_test", str(target.raw_row_id), "UPDATE", before, model_dict(target), user, source_operation)
+            return None
+
+        target = RawAttribute(**row, is_active=True, created_by=user, updated_by=user)
+        self.db.add(target)
+        existing.append(target)
+        return {
+            "schema": "dbo",
+            "table": "raw_prj_attribute_new_test",
+            "target": target,
+            "key_attr": "raw_row_id",
+            "user": user,
+            "source_operation": source_operation,
+        }
+
+    def upsert_staging_master_cached(
+        self,
+        row: dict[str, Any],
+        user: str,
+        source_operation: str,
+        cache: dict[str, StagingAttributeMaster],
+    ) -> None:
+        target = cache.get(str(row["prj_id"]))
+        fields = (
+            "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name",
+            "where_in_financial_statement", "is_active",
+        )
+        if target:
+            before = model_dict(target)
+            for field in fields:
+                setattr(target, field, row.get(field))
+            target.updated_at = datetime.utcnow()
+            target.updated_by = user
+            self.audit("stg", "prj_attribute_master_new_test", str(row["prj_id"]), "UPDATE", before, model_dict(target), user, source_operation)
+            return
+        target = StagingAttributeMaster(
+            **{field: row.get(field) for field in ("prj_id", *fields)},
+            created_by=user,
+            updated_by=user,
+        )
+        self.db.add(target)
+        cache[str(row["prj_id"])] = target
+        self.audit("stg", "prj_attribute_master_new_test", str(row["prj_id"]), "INSERT", None, model_dict(target), user, source_operation)
+
+    def upsert_staging_rule_cached(
+        self,
+        row: dict[str, Any],
+        user: str,
+        source_operation: str,
+        cache: dict[tuple[str, int], list[StagingBusinessRule]],
+    ) -> dict[str, Any] | None:
+        key = (str(row["prj_id"]), int(row["port_ref_id"]))
+        existing = cache.setdefault(key, [])
+        target = next(
+            (
+                item for item in existing
+                if item.source_abbr_name == row["source_abbr_name"]
+                and int(item.display_order) == int(row["display_order"])
+                and item.section == row["section"]
+                and item.subsection == row["subsection"]
+            ),
+            None,
+        )
+        if target is None and len(existing) == 1 and not source_operation.upper().startswith("BULK_"):
+            target = existing[0]
+        if target is None and len(existing) > 1 and not source_operation.upper().startswith("BULK_"):
+            raise ValueError(
+                f"Cannot unambiguously update staging rule for {row['prj_id']} / port_ref_id {row['port_ref_id']}; "
+                "multiple staged rules exist and the edited key no longer matches."
+            )
+        fields = (
+            "prj_id", "port_ref_id", "source_abbr_name", "editable", "symbol", "mapping_type", "calculation_logic",
+            "prj_attribute_description", "tech_logic", "display_order", "display_name", "section", "subsection",
+            "prompt_description", "examples", "is_active",
+        )
+        if target:
+            before = model_dict(target)
+            for field in fields:
+                setattr(target, field, row.get(field))
+            target.updated_at = datetime.utcnow()
+            target.updated_by = user
+            if target.scope_id is not None:
+                self.audit("stg", "prj_attribute_business_rules_new_test", str(target.scope_id), "UPDATE", before, model_dict(target), user, source_operation)
+            return None
+        target = StagingBusinessRule(**{field: row.get(field) for field in fields}, created_by=user, updated_by=user)
+        self.db.add(target)
+        existing.append(target)
+        return {
+            "schema": "stg",
+            "table": "prj_attribute_business_rules_new_test",
+            "target": target,
+            "key_attr": "scope_id",
+            "user": user,
+            "source_operation": source_operation,
+        }
+
+    def upsert_raw(
+        self,
+        row: dict[str, Any],
+        user: str,
+        source_operation: str,
+        defer_insert_audit: bool = False,
+    ) -> dict[str, Any] | None:
         existing = self.active_raw_for_scope(row["prj_id"], row["portfolio"])
         target = next(
             (
@@ -488,11 +792,21 @@ class DataDictionaryRepository:
             target.updated_at = datetime.utcnow()
             target.updated_by = user
             self.audit("dbo", "raw_prj_attribute_new_test", str(target.raw_row_id), "UPDATE", before, model_dict(target), user, source_operation)
-        else:
-            target = RawAttribute(**row, is_active=True, created_by=user, updated_by=user)
-            self.db.add(target)
-            self.db.flush()
-            self.audit("dbo", "raw_prj_attribute_new_test", str(target.raw_row_id), "INSERT", None, model_dict(target), user, source_operation)
+            return None
+        target = RawAttribute(**row, is_active=True, created_by=user, updated_by=user)
+        self.db.add(target)
+        if defer_insert_audit:
+            return {
+                "schema": "dbo",
+                "table": "raw_prj_attribute_new_test",
+                "target": target,
+                "key_attr": "raw_row_id",
+                "user": user,
+                "source_operation": source_operation,
+            }
+        self.db.flush()
+        self.audit("dbo", "raw_prj_attribute_new_test", str(target.raw_row_id), "INSERT", None, model_dict(target), user, source_operation)
+        return None
 
     def upsert_staging_master(self, row: dict[str, Any], user: str, source_operation: str) -> None:
         target = self.db.get(StagingAttributeMaster, row["prj_id"])
@@ -506,10 +820,15 @@ class DataDictionaryRepository:
         else:
             target = StagingAttributeMaster(**{key: row[key] for key in ("prj_id", "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name", "where_in_financial_statement", "is_active")}, created_by=user, updated_by=user)
             self.db.add(target)
-            self.db.flush()
             self.audit("stg", "prj_attribute_master_new_test", row["prj_id"], "INSERT", None, model_dict(target), user, source_operation)
 
-    def upsert_staging_rule(self, row: dict[str, Any], user: str, source_operation: str) -> None:
+    def upsert_staging_rule(
+        self,
+        row: dict[str, Any],
+        user: str,
+        source_operation: str,
+        defer_insert_audit: bool = False,
+    ) -> dict[str, Any] | None:
         existing = list(self.db.scalars(
             select(StagingBusinessRule)
             .where(StagingBusinessRule.prj_id == row["prj_id"], StagingBusinessRule.port_ref_id == row["port_ref_id"])
@@ -544,11 +863,40 @@ class DataDictionaryRepository:
             target.updated_at = datetime.utcnow()
             target.updated_by = user
             self.audit("stg", "prj_attribute_business_rules_new_test", str(target.scope_id), "UPDATE", before, model_dict(target), user, source_operation)
-        else:
-            target = StagingBusinessRule(**{key: row.get(key) for key in fields}, created_by=user, updated_by=user)
-            self.db.add(target)
-            self.db.flush()
-            self.audit("stg", "prj_attribute_business_rules_new_test", str(target.scope_id), "INSERT", None, model_dict(target), user, source_operation)
+            return None
+        target = StagingBusinessRule(**{key: row.get(key) for key in fields}, created_by=user, updated_by=user)
+        self.db.add(target)
+        if defer_insert_audit:
+            return {
+                "schema": "stg",
+                "table": "prj_attribute_business_rules_new_test",
+                "target": target,
+                "key_attr": "scope_id",
+                "user": user,
+                "source_operation": source_operation,
+            }
+        self.db.flush()
+        self.audit("stg", "prj_attribute_business_rules_new_test", str(target.scope_id), "INSERT", None, model_dict(target), user, source_operation)
+        return None
+
+    def emit_deferred_insert_audits(self, items: list[dict[str, Any]]) -> None:
+        if not items:
+            return
+        # One flush allocates all identity/serial keys for raw + staging rule
+        # inserts, instead of flushing separately for each table.
+        self.db.flush()
+        for item in items:
+            target = item["target"]
+            self.audit(
+                item["schema"],
+                item["table"],
+                str(getattr(target, item["key_attr"])),
+                "INSERT",
+                None,
+                model_dict(target),
+                item["user"],
+                item["source_operation"],
+            )
 
     def stage_delete_attribute(self, prj_id: str, active: bool, user: str, source_operation: str) -> None:
         base = self.get_master(prj_id, "stg") or self.get_master(prj_id, "dbo")

@@ -167,25 +167,39 @@ def mapping_type_from_value(value: str | None, original_type: str | None = None)
 
 
 def generate_tech_logic(calculation_logic: str | None) -> str:
-    """Keep PRJ references and arithmetic operators while removing descriptive labels."""
+    """Derive compact technical logic from a human-readable calculation formula.
+
+    Descriptive labels and parentheses around PRJ references are removed while
+    the PRJ identifiers and arithmetic operators are preserved.  For example::
+
+        Total Income(PRJ362) = EBITDA(PRJ43843) - Debt(PRJ4343)
+
+    becomes::
+
+        PRJ362 = PRJ43843-PRJ4343
+    """
     text = normalize_text(calculation_logic)
     if not text or text.upper() == "NA":
         return "NA"
-    first = re.search(r"\(?\bPRJ\d+\b\)?", text, flags=re.IGNORECASE)
+
+    first = re.search(r"\bPRJ\d+\b", text, flags=re.IGNORECASE)
     if not first:
         return "NA"
+
     expression = text[first.start():]
-    tokens = re.findall(r"\(?\bPRJ\d+\b\)?|[=+\-*/]", expression, flags=re.IGNORECASE)
+    tokens = re.findall(r"\bPRJ\d+\b|[=+\-*/]", expression, flags=re.IGNORECASE)
     if not tokens:
         return "NA"
-    rendered: list[str] = []
+
+    rendered = ""
     for token in tokens:
-        if re.search(r"PRJ\d+", token, flags=re.IGNORECASE):
-            prj = re.search(r"PRJ\d+", token, flags=re.IGNORECASE).group(0).upper()
-            rendered.append(f"({prj})")
+        if re.fullmatch(r"PRJ\d+", token, flags=re.IGNORECASE):
+            rendered += token.upper()
+        elif token == "=":
+            rendered = rendered.rstrip() + " = "
         else:
-            rendered.append(token)
-    return " ".join(rendered)
+            rendered = rendered.rstrip() + token
+    return rendered.strip() or "NA"
 
 
 ABBREVIATIONS = {

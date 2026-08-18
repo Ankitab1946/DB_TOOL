@@ -1,6 +1,7 @@
 """Streamlit UI. All database operations are performed through the FastAPI layer."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -141,9 +142,30 @@ for key, default in {
     "role": os.getenv("SELECTED_ROLE", "ADMIN").upper(),
     "view_rows": [],
     "view_total": 0,
+    "view_loaded": False,
+    "view_filter_signature": "",
     "selected_prj": "",
+    "edit_detail": None,
     "upload_preview": None,
+    "upload_stage_result": None,
     "upload_configs": [],
+    "upload_file_fingerprint": "",
+    "upload_sheet_names": [],
+    "upload_sheet_preview_cache": {},
+    "lookup_cache_key": "",
+    "lookup_cache": None,
+    "runtime_context_key": "",
+    "runtime_context": None,
+    "backend_health_key": "",
+    "backend_health": None,
+    "prompts_cache_key": "",
+    "prompts_cache": None,
+    "audit_cache_signature": "",
+    "audit_cache_rows": None,
+    "admin_portfolios_cache_key": "",
+    "admin_portfolios_cache": None,
+    "soft_deleted_cache_key": "",
+    "soft_deleted_cache": None,
     "latest_excel": None,
     "show_create": False,
     "show_edit": False,
@@ -156,7 +178,11 @@ for key, default in {
 }.items():
     st.session_state.setdefault(key, default)
 
-context = api("GET", "/system/context", quiet=True) or {
+context_key = f"{st.session_state['environment']}:{st.session_state['database_type']}:{st.session_state['role']}"
+if st.session_state.get("runtime_context_key") != context_key or st.session_state.get("runtime_context") is None:
+    st.session_state["runtime_context"] = api("GET", "/system/context", quiet=True)
+    st.session_state["runtime_context_key"] = context_key
+context = st.session_state.get("runtime_context") or {
     "environment": st.session_state["environment"],
     "environments": ["LOCAL", "DEV", "UAT", "PROD"],
     "db_type": st.session_state["database_type"],
@@ -177,6 +203,14 @@ with st.sidebar:
     selected_env = st.selectbox("Environment", environments, index=environments.index(current_env))
     if selected_env != st.session_state.get("environment"):
         st.session_state["environment"] = selected_env
+        st.session_state["view_loaded"] = False
+        st.session_state["lookup_cache"] = None
+        st.session_state["database_status_key"] = ""
+        st.session_state["runtime_context"] = None
+        st.session_state["prompts_cache"] = None
+        st.session_state["audit_cache_rows"] = None
+        st.session_state["admin_portfolios_cache"] = None
+        st.session_state["soft_deleted_cache"] = None
         st.rerun()
 
     # Always expose both supported database engines. Whether an engine is enabled
@@ -194,6 +228,14 @@ with st.sidebar:
     )
     if selected_db_type != st.session_state.get("database_type"):
         st.session_state["database_type"] = selected_db_type
+        st.session_state["view_loaded"] = False
+        st.session_state["lookup_cache"] = None
+        st.session_state["database_status_key"] = ""
+        st.session_state["runtime_context"] = None
+        st.session_state["prompts_cache"] = None
+        st.session_state["audit_cache_rows"] = None
+        st.session_state["admin_portfolios_cache"] = None
+        st.session_state["soft_deleted_cache"] = None
         st.rerun()
 
     roles = ["ADMIN", "USER"]
@@ -208,9 +250,11 @@ with st.sidebar:
     )
     if selected_role != st.session_state.get("role"):
         st.session_state["role"] = selected_role
+        st.session_state["runtime_context"] = None
+        st.session_state["backend_health"] = None
         st.rerun()
 
-    refreshed = api("GET", "/system/context", quiet=True) or context
+    refreshed = context
     st.text_input("Database", value=str(refreshed.get("database", "Unknown")), disabled=True)
     st.text_input("Server", value=str(refreshed.get("server", "Unknown")), disabled=True)
     st.text_input("Current User", value=str(refreshed.get("current_user", CURRENT_USER)), disabled=True)
@@ -240,7 +284,13 @@ with st.sidebar:
     if not refreshed.get("database_enabled", False):
         st.warning("Database access is disabled for this environment.")
 
-lookups = api("GET", "/lookups", quiet=True) or {"portfolios": [], "sources": [], "sections": [], "subsections": []}
+lookup_key = f"{st.session_state['environment']}:{st.session_state['database_type']}"
+if st.session_state.get("lookup_cache_key") != lookup_key or st.session_state.get("lookup_cache") is None:
+    st.session_state["lookup_cache"] = api("GET", "/lookups", quiet=True) or {
+        "portfolios": [], "sources": [], "sections": [], "subsections": []
+    }
+    st.session_state["lookup_cache_key"] = lookup_key
+lookups = st.session_state.get("lookup_cache") or {"portfolios": [], "sources": [], "sections": [], "subsections": []}
 portfolio_labels = list(dict.fromkeys(
     item.get("label") for item in lookups.get("portfolios", []) if item.get("label")
 ))
@@ -254,8 +304,8 @@ source_by_code = {item.get("source_code"): item.get("source_name") for item in l
 def source_label(code: str) -> str:
     return f"{code}[{source_by_code.get(code, code)}]"
 
-create_modal = Modal("Create New Attribute", key="create_attribute_modal", max_width=1450)
-edit_modal = Modal("Edit Attribute", key="edit_attribute_modal", max_width=1450)
+create_modal = Modal("Create New Attribute", key="create_attribute_modal", max_width=1650)
+edit_modal = Modal("Edit Attribute", key="edit_attribute_modal", max_width=1650)
 finalize_modal = Modal("Finalize and Upload", key="finalize_modal", max_width=720)
 
 
@@ -269,29 +319,47 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         rule_index = int(selected)
     rule = rules[rule_index] if rules else {}
 
-    next_id = api("GET", "/lookups/next-prj-id", quiet=True) if not detail else None
-    prj_id = detail.get("prj_id") or (next_id or {}).get("prj_id", "Auto")
-    st.text_input("PRJID", value=str(prj_id), disabled=True, key=f"{prefix}_prj")
+    next_id = None
+    if not detail:
+        # Streamlit reruns on every widget interaction. Keep the generated ID in
+        # session state so typing in the form does not rescan the DB repeatedly.
+        next_id_key = f"{prefix}_next_prj_id"
+        if next_id_key not in st.session_state:
+            st.session_state[next_id_key] = api("GET", "/lookups/next-prj-id", quiet=True) or {}
+        next_id = st.session_state.get(next_id_key)
+    prj_id = detail.get("prj_id") or (next_id or {}).get("prj_id", "")
+    st.text_input(
+        "CFV ID",
+        value=str(prj_id),
+        disabled=True,
+        key=f"{prefix}_prj",
+        help="Generated automatically by the application and stored as the PRJ ID database key.",
+    )
+    if not detail and not prj_id:
+        st.error("CFV ID could not be generated. Close and reopen the form after checking the API/database connection.")
     c1, c2 = st.columns(2)
     attribute_name = c1.text_input("PRJ Attribute Name *", value=str(detail.get("prj_attribute_name") or ""), disabled=locked, key=f"{prefix}_name")
     physical_default = str(detail.get("prj_physical_attribute_name") or "").strip()
-    physical = physical_default
-    suggestion = None
-    if attribute_name and not physical_default:
-        suggestion = api(
-            "GET",
-            "/lookups/physical-name-suggestions",
-            quiet=True,
-            params={"attribute_name": attribute_name, "prj_id": detail.get("prj_id") or str(prj_id)},
-        )
-        physical = str((suggestion or {}).get("selected") or (suggestion or {}).get("generated") or generate_physical_name(attribute_name))
-    elif attribute_name and not locked:
-        suggestion = api(
-            "GET",
-            "/lookups/physical-name-suggestions",
-            quiet=True,
-            params={"attribute_name": attribute_name, "prj_id": detail.get("prj_id") or str(prj_id)},
-        )
+    physical = physical_default or (generate_physical_name(attribute_name) if attribute_name else "")
+    suggestion_key = f"{prefix}_physical_suggestion"
+    suggestion = st.session_state.get(suggestion_key)
+    if suggestion and suggestion.get("attribute_name") != attribute_name:
+        suggestion = None
+        st.session_state.pop(suggestion_key, None)
+
+    if attribute_name and not locked:
+        if st.button("Check physical name availability", key=f"{prefix}_check_physical"):
+            checked = api(
+                "GET",
+                "/lookups/physical-name-suggestions",
+                quiet=True,
+                params={"attribute_name": attribute_name, "prj_id": detail.get("prj_id") or str(prj_id)},
+            ) or {}
+            checked["attribute_name"] = attribute_name
+            st.session_state[suggestion_key] = checked
+            suggestion = checked
+        if suggestion and not physical_default:
+            physical = str(suggestion.get("selected") or suggestion.get("generated") or physical)
 
     if detail:
         physical = c2.text_input(
@@ -344,28 +412,64 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     data_type = c3.selectbox("DATA TYPE", dtype_options, index=dtype_index, disabled=locked, key=f"{prefix}_dtype")
 
     c1, c2 = st.columns(2)
-    section = c1.text_input("Section *", value=str(rule.get("section") or ""), disabled=locked, key=f"{prefix}_section")
-    subsection = c2.text_input("Sub-Section *", value=str(rule.get("subsection") or ""), disabled=locked, key=f"{prefix}_subsection")
+    section = c1.text_input(
+        "Section *",
+        value=str(rule.get("section") or ""),
+        disabled=locked,
+        key=f"{prefix}_section",
+        placeholder="e.g. Assets|Liabilities",
+        help="Enter one or more Sections. Separate multiple values with | (pipe).",
+    )
+    subsection = c2.text_input(
+        "Sub-Section *",
+        value=str(rule.get("subsection") or ""),
+        disabled=locked,
+        key=f"{prefix}_subsection",
+        placeholder="e.g. Current|Non-Current",
+        help="Enter one or more Sub-Sections. Separate multiple values with | (pipe).",
+    )
     mapping_default = str(rule.get("mapping_type") or "Reported")
     mapping_options = ["Calculated", "Reported", "Repeated"]
     mapping_index = mapping_options.index(mapping_default) if mapping_default in mapping_options else 1
     calculated = st.selectbox("Calculated or Reported *", mapping_options, index=mapping_index, disabled=locked, key=f"{prefix}_mapping")
-    calculation_logic = st.text_area("Calculation Logic", value=str(rule.get("calculation_logic") or "NA"), disabled=locked, height=120, key=f"{prefix}_calc")
     segment = st.text_input("Segment", value=str(detail.get("where_in_financial_statement") or "NA"), disabled=locked, key=f"{prefix}_segment")
-    attribute_definition = st.text_area("Attribute Definition", value=str(detail.get("prj_attribute_definition") or ""), disabled=locked, height=100, key=f"{prefix}_definition")
-    attribute_description = st.text_area("Attribute Description / Proposed Prompt", value=str(rule.get("prj_attribute_description") or ""), disabled=locked, height=120, key=f"{prefix}_description")
-    c1, c2 = st.columns(2)
-    display_order = c1.number_input("Display Order *", min_value=0, value=int(rule.get("display_order") or 0), step=1, disabled=locked, key=f"{prefix}_order")
-    display_name = c2.text_input("Display Name", value=str(rule.get("display_name") or detail.get("prj_attribute_name") or ""), disabled=locked, key=f"{prefix}_display")
+
+    st.markdown("#### Calculation & Attribute Details")
+    logic_left, logic_right = st.columns(2)
+    calculation_logic = logic_left.text_area(
+        "Calculation Logic",
+        value=str(rule.get("calculation_logic") or "NA"),
+        disabled=locked,
+        height=145,
+        key=f"{prefix}_calc",
+    )
+    attribute_definition = logic_right.text_area(
+        "Attribute Definition",
+        value=str(detail.get("prj_attribute_definition") or ""),
+        disabled=locked,
+        height=145,
+        key=f"{prefix}_definition",
+    )
+    detail_left, detail_right = st.columns(2)
+    attribute_description = detail_left.text_area(
+        "Attribute Description",
+        value=str(rule.get("prj_attribute_description") or ""),
+        disabled=locked,
+        height=145,
+        key=f"{prefix}_description",
+    )
     tech_preview = str(rule.get("tech_logic") or generate_tech_logic(calculation_logic))
-    tech_logic = st.text_area(
+    tech_logic = detail_right.text_area(
         "Tech Logic",
         value=tech_preview,
         disabled=locked,
-        height=120,
+        height=145,
         key=f"{prefix}_tech",
         help="Auto-populated from Calculation Logic when blank; it can be updated before saving.",
     )
+    c1, c2 = st.columns(2)
+    display_order = c1.number_input("Display Order *", min_value=0, value=int(rule.get("display_order") or 0), step=1, disabled=locked, key=f"{prefix}_order")
+    display_name = c2.text_input("Display Name", value=str(rule.get("display_name") or detail.get("prj_attribute_name") or ""), disabled=locked, key=f"{prefix}_display")
     examples = st.text_area("Examples (Prompt Management)", value=str(rule.get("examples") or ""), disabled=locked, height=80, key=f"{prefix}_examples")
 
     if locked:
@@ -373,11 +477,14 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     submitted = st.button("Create Attribute" if not detail else "Save Changes", type="primary", key=f"{prefix}_submit")
     if not submitted:
         return None
+    if not prj_id:
+        st.error("CFV ID is mandatory and must be generated before creating the attribute.")
+        return None
     if not attribute_name.strip() or not section.strip() or not subsection.strip():
         st.error("PRJ Attribute Name, Section and Sub-Section are mandatory.")
         return None
     return {
-        "prj_id": None if not detail else detail.get("prj_id"),
+        "prj_id": str(prj_id),
         "portfolio": portfolio,
         "source_abbr_name": source_code,
         "prj_attribute_name": attribute_name,
@@ -400,6 +507,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
 
 
 is_admin = bool(refreshed.get("is_admin"))
+modal_active = bool(st.session_state.get("show_create") or st.session_state.get("show_edit"))
 main_tab_labels = ["Data Dictionary", "Prompt Management", "Audit"] + (["Admin Tools"] if is_admin else [])
 main_tabs = st.tabs(main_tab_labels)
 
@@ -448,8 +556,11 @@ with main_tabs[0]:
 
         create_col, deleted_col, _ = st.columns([1.7, 2.0, 5])
         if create_col.button("Create New Attribute", type="primary", use_container_width=True):
-            st.session_state["show_create"] = True
-            create_modal.open()
+            next_id = api("GET", "/lookups/next-prj-id")
+            if next_id and next_id.get("prj_id"):
+                st.session_state["create_next_prj_id"] = next_id
+                st.session_state["show_create"] = True
+                create_modal.open()
         if deleted_col.button(
             "Hide Soft Deleted Records" if st.session_state.get("show_soft_deleted") else "View Soft Deleted Records",
             use_container_width=True,
@@ -458,7 +569,11 @@ with main_tabs[0]:
             st.rerun()
 
         if st.session_state.get("show_soft_deleted"):
-            deleted_rows = api("GET", "/data-dictionary/soft-deleted", quiet=True) or []
+            soft_deleted_key = f"{st.session_state['environment']}:{st.session_state['database_type']}"
+            if st.session_state.get("soft_deleted_cache_key") != soft_deleted_key or st.session_state.get("soft_deleted_cache") is None:
+                st.session_state["soft_deleted_cache"] = api("GET", "/data-dictionary/soft-deleted", quiet=True) or []
+                st.session_state["soft_deleted_cache_key"] = soft_deleted_key
+            deleted_rows = st.session_state.get("soft_deleted_cache") or []
             st.markdown("#### Soft Deleted Records")
             st.caption(
                 "These records are inactive in the final tables. Pending soft deletes remain in Delta until finalized."
@@ -494,10 +609,14 @@ with main_tabs[0]:
                 st.info("No finalized soft deleted records found.")
             st.divider()
 
-        result = api("POST", "/data-dictionary/filter-page", json=payload, quiet=True)
-        if result:
-            st.session_state["view_rows"] = result.get("rows", [])
-            st.session_state["view_total"] = result.get("total", 0)
+        filter_signature = json.dumps(payload, sort_keys=True, default=str)
+        if not st.session_state.get("view_loaded"):
+            result = api("POST", "/data-dictionary/filter-page", json=payload, quiet=True)
+            if result:
+                st.session_state["view_rows"] = result.get("rows", [])
+                st.session_state["view_total"] = result.get("total", 0)
+                st.session_state["view_filter_signature"] = filter_signature
+                st.session_state["view_loaded"] = True
         rows = st.session_state.get("view_rows", [])
 
         b1, b2, b3, b4 = st.columns([1.2, 1.2, 1.2, 4])
@@ -505,6 +624,9 @@ with main_tabs[0]:
             result = api("POST", "/data-dictionary/filter-page", json=payload)
             if result:
                 st.session_state["view_rows"] = result.get("rows", [])
+                st.session_state["view_total"] = result.get("total", 0)
+                st.session_state["view_filter_signature"] = filter_signature
+                st.session_state["view_loaded"] = True
                 rows = st.session_state["view_rows"]
         if b2.button("Download Latest", use_container_width=True):
             response = api("GET", "/data-dictionary/download-latest", binary=True)
@@ -519,6 +641,8 @@ with main_tabs[0]:
                 use_container_width=True,
             )
         b4.caption(f"{st.session_state.get('view_total', 0)} matching attribute(s)")
+        if st.session_state.get("view_filter_signature") and st.session_state.get("view_filter_signature") != filter_signature:
+            st.caption("Filters changed. Click **View Latest** to refresh the grid.")
 
         if rows:
             grid_columns = [
@@ -544,16 +668,21 @@ with main_tabs[0]:
 
             action1, action2, action3, _ = st.columns([1.2, 1.2, 1.2, 4])
             if action1.button("Edit", disabled=not selected_prj, use_container_width=True):
-                st.session_state["selected_prj"] = selected_prj
-                st.session_state["show_edit"] = True
-                st.session_state["edit_unlocked"] = True
-                edit_modal.open()
+                detail = api("GET", f"/data-dictionary/attributes/{selected_prj}") if selected_prj else None
+                if detail:
+                    st.session_state["selected_prj"] = selected_prj
+                    st.session_state["edit_detail"] = detail
+                    st.session_state["show_edit"] = True
+                    st.session_state["edit_unlocked"] = True
+                    edit_modal.open()
             if action2.button("Soft Delete", disabled=not selected_prj, use_container_width=True):
                 response = api("DELETE", f"/data-dictionary/attributes/{selected_prj}")
                 if response:
                     st.session_state["flash_message"] = (
                         f"{selected_prj} soft delete staged successfully. Review Delta, then Finalize and Upload."
                     )
+                    st.session_state["audit_cache_rows"] = None
+                    st.session_state["soft_deleted_cache"] = None
                     st.rerun()
             if action3.button("Reactivate", disabled=not selected_prj, use_container_width=True):
                 response = api("POST", f"/data-dictionary/attributes/{selected_prj}/reactivate")
@@ -561,6 +690,8 @@ with main_tabs[0]:
                     st.session_state["flash_message"] = (
                         f"{selected_prj} reactivation staged successfully. Review Delta, then Finalize and Upload."
                     )
+                    st.session_state["audit_cache_rows"] = None
+                    st.session_state["soft_deleted_cache"] = None
                     st.rerun()
         else:
             st.info("No records loaded for the selected filters.")
@@ -574,9 +705,19 @@ with main_tabs[0]:
             )
             uploaded = st.file_uploader("Master Dictionary Excel", type=["xlsx"], key="master_upload_file")
             if uploaded:
-                file_tuple = (uploaded.name, uploaded.getvalue(), uploaded.type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                sheets_result = api("POST", "/master-upload/sheets", files={"file": file_tuple})
-                sheets = sheets_result.get("sheets", []) if sheets_result else []
+                file_bytes = uploaded.getvalue()
+                file_fingerprint = hashlib.sha256(file_bytes).hexdigest()
+                file_tuple = (uploaded.name, file_bytes, uploaded.type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                if st.session_state.get("upload_file_fingerprint") != file_fingerprint:
+                    st.session_state["upload_file_fingerprint"] = file_fingerprint
+                    st.session_state["upload_sheet_names"] = []
+                    st.session_state["upload_sheet_preview_cache"] = {}
+                    st.session_state["upload_preview"] = None
+                    st.session_state["upload_stage_result"] = None
+                if not st.session_state.get("upload_sheet_names"):
+                    sheets_result = api("POST", "/master-upload/sheets", files={"file": file_tuple})
+                    st.session_state["upload_sheet_names"] = sheets_result.get("sheets", []) if sheets_result else []
+                sheets = st.session_state.get("upload_sheet_names", [])
                 mode_type = st.radio("Sheet mode", ["Single Sheet", "Multi-Sheet Merger"], horizontal=True)
                 selected_sheets = (
                     [st.selectbox("Sheet", sheets)] if mode_type == "Single Sheet" and sheets
@@ -628,17 +769,21 @@ with main_tabs[0]:
                                 "'Bank Attribute' → FI Banks. Select another value only when you want to override detection."
                             ),
                         )
-                        preview = api(
-                            "POST",
-                            "/master-upload/preview-sheet",
-                            files={"file": file_tuple},
-                            data={
-                                "sheet_name": sheet_name,
-                                "header_row": int(header_row),
-                                "data_start_row": int(data_start_row),
-                            },
-                            quiet=True,
-                        )
+                        preview_cache_key = f"{file_fingerprint}:{sheet_name}:{int(header_row)}:{int(data_start_row)}"
+                        preview_cache = st.session_state.setdefault("upload_sheet_preview_cache", {})
+                        if preview_cache_key not in preview_cache:
+                            preview_cache[preview_cache_key] = api(
+                                "POST",
+                                "/master-upload/preview-sheet",
+                                files={"file": file_tuple},
+                                data={
+                                    "sheet_name": sheet_name,
+                                    "header_row": int(header_row),
+                                    "data_start_row": int(data_start_row),
+                                },
+                                quiet=True,
+                            )
+                        preview = preview_cache.get(preview_cache_key)
                         mapping: dict[str, str] = {}
                         if preview:
                             st.caption(
@@ -677,7 +822,11 @@ with main_tabs[0]:
                         "REPLACE clears current raw/staging pending data before loading; final tables remain unchanged until finalization."
                     ),
                 )
-                backend_health = api("GET", "/health", quiet=True) or {}
+                health_key = f"{API}:{st.session_state['environment']}:{st.session_state['database_type']}"
+                if st.session_state.get("backend_health_key") != health_key or st.session_state.get("backend_health") is None:
+                    st.session_state["backend_health"] = api("GET", "/health", quiet=True) or {}
+                    st.session_state["backend_health_key"] = health_key
+                backend_health = st.session_state.get("backend_health") or {}
                 backend_modes = backend_health.get("upload_modes") or []
                 backend_supports_current_mode = upload_mode in backend_modes
                 if backend_health and not backend_supports_current_mode:
@@ -713,18 +862,67 @@ with main_tabs[0]:
                         data={"configurations_json": json.dumps(configs), "mode": upload_mode},
                     )
                     if result:
+                        st.session_state["upload_stage_result"] = result
+                        st.session_state["audit_cache_rows"] = None
+                        st.session_state["prompts_cache"] = None
                         st.success(
                             f"Staged {result.get('staged_count', 0)} rows; "
                             f"skipped existing {result.get('skipped_existing_count', 0)} PRJ ID(s); "
-                            f"rejected {result.get('rejected_count', 0)} rows."
+                            f"rejected {result.get('rejected_count', 0)} rows. "
+                            "Final dbo master/business-rule tables are unchanged until Finalize and Upload."
                         )
-                        st.session_state["upload_preview"] = result
-                if st.session_state.get("upload_preview"):
-                    st.json(st.session_state["upload_preview"])
+
+                validation = st.session_state.get("upload_preview")
+                if validation:
+                    st.markdown("#### Validate & Compare Summary")
+                    delta = validation.get("delta") or {}
+                    summary = delta.get("summary") or {}
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Records to Insert", int(summary.get("inserted", 0)))
+                    m2.metric("Records to Update", int(summary.get("updated", 0)))
+                    m3.metric("Records to Delete", int(summary.get("deleted", 0)))
+                    m4.metric("Unchanged", int(summary.get("unchanged", 0)))
+                    st.caption(
+                        f"Valid rows: {validation.get('valid_count', 0)} | "
+                        f"Eligible rows: {validation.get('eligible_count', 0)} | "
+                        f"Skipped existing: {validation.get('skipped_existing_count', 0)} | "
+                        f"Rejected: {len(validation.get('rejected') or [])}"
+                    )
+                    delta_rows = delta.get("rows") or []
+                    if delta_rows:
+                        st.markdown("##### Changed PRJ IDs")
+                        st.dataframe(pd.DataFrame(delta_rows), use_container_width=True, hide_index=True, height=260)
+                    change_rows = delta.get("changes") or []
+                    if change_rows:
+                        st.markdown("##### Before / After Changes")
+                        st.dataframe(
+                            pd.DataFrame(change_rows)[
+                                ["prj_id", "change_type", "scope", "field", "before_value", "after_value"]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                            height=420,
+                        )
+                    rejected_rows = validation.get("rejected") or []
+                    if rejected_rows:
+                        with st.expander(f"Rejected rows ({len(rejected_rows)})"):
+                            st.dataframe(pd.DataFrame(rejected_rows), use_container_width=True, hide_index=True)
+
+                stage_result = st.session_state.get("upload_stage_result")
+                if stage_result:
+                    st.caption(
+                        f"Last stage: {stage_result.get('staged_count', 0)} staged, "
+                        f"{stage_result.get('skipped_existing_count', 0)} skipped, "
+                        f"{stage_result.get('rejected_count', 0)} rejected."
+                    )
 
     with finalize_tab:
         st.subheader("Finalize and Upload")
-        delta = api("GET", "/data-dictionary/delta", quiet=True) or {"rows": [], "has_changes": False, "count": 0}
+        delta = (
+            {"rows": [], "has_changes": False, "count": 0}
+            if modal_active
+            else (api("GET", "/data-dictionary/delta", quiet=True) or {"rows": [], "has_changes": False, "count": 0})
+        )
         st.caption(f"Pending delta: {delta.get('count', 0)} attribute(s)")
         if delta.get("rows"):
             st.dataframe(pd.DataFrame(delta["rows"]), use_container_width=True, hide_index=True)
@@ -746,7 +944,13 @@ with main_tabs[0]:
 
 with main_tabs[1]:
     st.subheader("Prompt Management")
-    prompts = api("GET", "/prompts?include_deleted=true", quiet=True) or []
+    prompts_key = f"{st.session_state['environment']}:{st.session_state['database_type']}"
+    if not modal_active and (
+        st.session_state.get("prompts_cache_key") != prompts_key or st.session_state.get("prompts_cache") is None
+    ):
+        st.session_state["prompts_cache"] = api("GET", "/prompts?include_deleted=true", quiet=True) or []
+        st.session_state["prompts_cache_key"] = prompts_key
+    prompts = st.session_state.get("prompts_cache") or []
     if prompts:
         search_prompt = st.text_input("Search prompts")
         filtered = prompts
@@ -762,6 +966,8 @@ with main_tabs[1]:
         if st.button("Stage Prompt Changes", type="primary"):
             response = api("PUT", f"/prompts/{selected_scope}", json={"scope_id": selected_scope, "prompt_description": prompt_description or None, "examples": examples or None})
             if response:
+                st.session_state["prompts_cache"] = None
+                st.session_state["audit_cache_rows"] = None
                 st.success("Prompt changes staged. Use Finalize and Upload in Data Dictionary to publish them.")
     else:
         st.info("No prompt/business-rule rows available.")
@@ -774,13 +980,20 @@ with main_tabs[2]:
     performed_by = a3.text_input("Performed By")
     source_operation = a4.text_input("Source Operation")
     audit_search = st.text_input("Search before/after values")
-    audit_rows = api("POST", "/audit/filter", json={
+    audit_payload = {
         "table_name": table_name or None,
         "action": action or None,
         "performed_by": performed_by or None,
         "source_operation": source_operation or None,
         "search": audit_search or None,
-    }, quiet=True) or []
+    }
+    audit_signature = f"{st.session_state['environment']}:{st.session_state['database_type']}:" + json.dumps(audit_payload, sort_keys=True)
+    if not modal_active and (
+        st.session_state.get("audit_cache_signature") != audit_signature or st.session_state.get("audit_cache_rows") is None
+    ):
+        st.session_state["audit_cache_rows"] = api("POST", "/audit/filter", json=audit_payload, quiet=True) or []
+        st.session_state["audit_cache_signature"] = audit_signature
+    audit_rows = st.session_state.get("audit_cache_rows") or []
     if audit_rows:
         st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True, height=520)
     else:
@@ -789,7 +1002,14 @@ with main_tabs[2]:
 if is_admin:
     with main_tabs[3]:
         st.subheader("Admin Tools")
-        portfolios_admin = api("GET", "/portfolio-reference", quiet=True) or []
+        admin_portfolios_key = f"{st.session_state['environment']}:{st.session_state['database_type']}"
+        if not modal_active and (
+            st.session_state.get("admin_portfolios_cache_key") != admin_portfolios_key
+            or st.session_state.get("admin_portfolios_cache") is None
+        ):
+            st.session_state["admin_portfolios_cache"] = api("GET", "/portfolio-reference", quiet=True) or []
+            st.session_state["admin_portfolios_cache_key"] = admin_portfolios_key
+        portfolios_admin = st.session_state.get("admin_portfolios_cache") or []
         st.markdown("#### Portfolio Reference")
         if portfolios_admin:
             st.dataframe(pd.DataFrame(portfolios_admin), use_container_width=True, hide_index=True)
@@ -807,6 +1027,9 @@ if is_admin:
                     "remark": remark or None,
                 })
                 if result:
+                    st.session_state["lookup_cache"] = None
+                    st.session_state["admin_portfolios_cache"] = None
+                    st.session_state["audit_cache_rows"] = None
                     st.success(f"Created port_ref_id {result.get('port_ref_id')}")
         st.markdown("#### Deployment")
         st.code("poetry run uvicorn DataDictionaryAdminApp.api.swagger_app:app --host 0.0.0.0 --port 8503")
@@ -833,16 +1056,24 @@ if st.session_state.get("show_create"):
                         f"Saved to: {staged_tables}"
                     )
                     st.session_state["show_create"] = False
+                    st.session_state["audit_cache_rows"] = None
+                    st.session_state["prompts_cache"] = None
+                    st.session_state.pop("create_next_prj_id", None)
+                    st.session_state.pop("create_prj", None)
+                    st.session_state.pop("create_physical_suggestion", None)
                     create_modal.close()
                     st.rerun()
             if st.button("Close", key="create_close"):
                 st.session_state["show_create"] = False
+                st.session_state.pop("create_next_prj_id", None)
+                st.session_state.pop("create_prj", None)
+                st.session_state.pop("create_physical_suggestion", None)
                 create_modal.close()
                 st.rerun()
 
 if st.session_state.get("show_edit"):
     selected_prj = st.session_state.get("selected_prj")
-    detail = api("GET", f"/data-dictionary/attributes/{selected_prj}", quiet=True) if selected_prj else None
+    detail = st.session_state.get("edit_detail")
     if not edit_modal.is_open():
         edit_modal.open()
     if edit_modal.is_open():
@@ -856,12 +1087,16 @@ if st.session_state.get("show_edit"):
                             f"{selected_prj} changes staged successfully. Review the delta before finalization."
                         )
                         st.session_state["show_edit"] = False
+                        st.session_state["audit_cache_rows"] = None
+                        st.session_state["prompts_cache"] = None
                         st.session_state["edit_unlocked"] = False
+                        st.session_state["edit_detail"] = None
                         edit_modal.close()
                         st.rerun()
             if st.button("Close", key="edit_close"):
                 st.session_state["show_edit"] = False
                 st.session_state["edit_unlocked"] = False
+                st.session_state["edit_detail"] = None
                 edit_modal.close()
                 st.rerun()
 
@@ -872,6 +1107,14 @@ if finalize_modal.is_open():
         if c1.button("Yes Upload", type="primary", use_container_width=True):
             result = api("POST", "/data-dictionary/finalize", json={"confirm": True})
             if result:
+                st.session_state["view_loaded"] = False
+                st.session_state["lookup_cache"] = None
+                st.session_state["prompts_cache"] = None
+                st.session_state["audit_cache_rows"] = None
+                st.session_state["admin_portfolios_cache"] = None
+                st.session_state["soft_deleted_cache"] = None
+                st.session_state["upload_preview"] = None
+                st.session_state["upload_stage_result"] = None
                 st.success(result.get("message", "Finalized successfully."))
                 finalize_modal.close()
                 st.rerun()

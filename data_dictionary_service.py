@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, true
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -26,7 +26,6 @@ from DataDictionaryAdminApp.utils.normalizers import (
     mapping_type_from_value,
     normalize_text,
 )
-from DataDictionaryAdminApp.utils.sqlalchemy_compat import boolean_equals
 
 
 MASTER_COMPARE_FIELDS = (
@@ -200,6 +199,8 @@ class DataDictionaryService:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "prj_id": master["prj_id"],
+            # UI compatibility label for the generated identifier; the persisted key remains PRJ ID.
+            "cfv_id": master["prj_id"],
             "staged": True,
             "portfolio": payload.portfolio,
             "prj_physical_attribute_name": master["prj_physical_attribute_name"],
@@ -607,7 +608,7 @@ class DataDictionaryService:
             )
         )
         if not include_deleted:
-            stmt = stmt.where(boolean_equals(AttributeBusinessRule.is_active))
+            stmt = stmt.where(AttributeBusinessRule.is_active == true())
         rows: list[dict[str, Any]] = []
         for rule, portfolio in self.db.execute(stmt).all():
             rows.append(

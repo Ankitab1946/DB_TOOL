@@ -69,15 +69,8 @@ st.markdown(
 .stTabs [aria-selected="true"] { background:#dceafa !important; border-color:#86a7c8 !important; }
 [data-testid="stDataFrame"], [data-testid="stDataEditor"] { border:1px solid #c6d6e5; border-radius:6px; overflow:hidden; }
 .small-note { color:#5b6f84; font-size:.84rem; }
-/* Center the large Create/Edit modals in the browser viewport.  The modal
-   package already centers horizontally; top/transform completes viewport
-   centering without changing its scrolling or width behavior. */
-div[data-modal-container='true'][key='create_attribute_modal'],
-div[data-modal-container='true'][key='edit_attribute_modal'] {
-    top: 50% !important;
-    bottom: auto !important;
-    transform: translateY(-50%) !important;
-}
+/* Create/Edit modal sizing is injected inside the modal container itself so
+   it is rendered after streamlit-modal's own stylesheet and wins reliably. */
 </style>
 """,
     unsafe_allow_html=True,
@@ -344,16 +337,59 @@ create_modal = StateAwareModal(
     "Create New Attribute",
     key="create_attribute_modal",
     state_flag="show_create",
-    max_width=1650,
+    max_width=1780,
 )
 edit_modal = StateAwareModal(
     "Edit Attribute",
     key="edit_attribute_modal",
     state_flag="show_edit",
-    max_width=1650,
+    max_width=1780,
 )
 finalize_modal = Modal("Finalize and Upload", key="finalize_modal", max_width=720)
 cleanup_modal = Modal("Cleanup Database", key="cleanup_database_modal", max_width=980)
+
+
+def render_attribute_modal_style(modal_key: str) -> None:
+    """Center Create/Edit modals and make them nearly full-screen.
+
+    ``streamlit-modal`` injects its stylesheet when ``container()`` is entered,
+    so this override is intentionally rendered *inside* the modal afterwards.
+    That makes the centering/width rules deterministic instead of depending on
+    stylesheet order from the main page.
+    """
+    st.markdown(
+        f"""
+<style>
+div[data-modal-container='true'][key='{modal_key}'] {{
+    top: 0 !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    min-height: 100vh !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    overflow: hidden !important;
+}}
+div[data-modal-container='true'][key='{modal_key}'] > div:first-child {{
+    width: 94vw !important;
+    max-width: 1780px !important;
+    margin: 0 auto !important;
+}}
+div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child {{
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}}
+div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child > div:first-child {{
+    max-height: 88vh !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+}}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bool = False) -> dict[str, Any] | None:
@@ -481,47 +517,80 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     calculated = st.selectbox("Calculated or Reported *", mapping_options, index=mapping_index, disabled=locked, key=f"{prefix}_mapping")
     segment = st.text_input("Segment", value=str(detail.get("where_in_financial_statement") or "NA"), disabled=locked, key=f"{prefix}_segment")
 
-    st.markdown("#### Calculation & Attribute Details")
-    logic_left, logic_right = st.columns(2)
-    calculation_logic = logic_left.text_area(
-        "Calculation Logic",
-        value=str(rule.get("calculation_logic") or "NA"),
-        disabled=locked,
-        height=145,
-        key=f"{prefix}_calc",
-    )
-    attribute_definition = logic_right.text_area(
-        "Attribute Definition",
-        value=str(detail.get("prj_attribute_definition") or ""),
-        disabled=locked,
-        height=145,
-        key=f"{prefix}_definition",
-    )
-    detail_left, detail_right = st.columns(2)
-    attribute_description = detail_left.text_area(
-        "Attribute Description",
-        value=str(rule.get("prj_attribute_description") or ""),
-        disabled=locked,
-        height=145,
-        key=f"{prefix}_description",
-    )
-    tech_preview = str(rule.get("tech_logic") or generate_tech_logic(calculation_logic))
-    tech_logic = detail_right.text_area(
-        "Tech Logic",
-        value=tech_preview,
-        disabled=locked,
-        height=145,
-        key=f"{prefix}_tech",
-        help="Auto-populated from Calculation Logic when blank; it can be updated before saving.",
-    )
+    with st.expander("Calculation and Attribute Details", expanded=False):
+        logic_left, logic_right = st.columns(2)
+        calculation_logic = logic_left.text_area(
+            "Calculation Logic",
+            value=str(rule.get("calculation_logic") or "NA"),
+            disabled=locked,
+            height=145,
+            key=f"{prefix}_calc",
+            help="Tech Logic is regenerated whenever Calculation Logic changes.",
+        )
+        attribute_definition = logic_right.text_area(
+            "Attribute Definition",
+            value=str(detail.get("prj_attribute_definition") or ""),
+            disabled=locked,
+            height=145,
+            key=f"{prefix}_definition",
+        )
+        detail_left, detail_right = st.columns(2)
+        attribute_description = detail_left.text_area(
+            "Attribute Description",
+            value=str(rule.get("prj_attribute_description") or ""),
+            disabled=locked,
+            height=145,
+            key=f"{prefix}_description",
+        )
+
+        # Keep Tech Logic synchronized with Calculation Logic without overwriting
+        # a user's manual Tech Logic edit on unrelated Streamlit reruns.  A new
+        # attribute/scope context is seeded from its stored Tech Logic; changing
+        # Calculation Logic regenerates the compact PRJ-only expression.
+        tech_key = f"{prefix}_tech"
+        tech_context_key = f"{prefix}_tech_context"
+        tech_calc_key = f"{prefix}_tech_source_calc"
+        tech_context = f"{prj_id}:{rule_index}"
+        stored_tech = str(rule.get("tech_logic") or "").strip()
+        if st.session_state.get(tech_context_key) != tech_context:
+            st.session_state[tech_key] = stored_tech or generate_tech_logic(calculation_logic)
+            st.session_state[tech_context_key] = tech_context
+            st.session_state[tech_calc_key] = calculation_logic
+        elif st.session_state.get(tech_calc_key) != calculation_logic:
+            st.session_state[tech_key] = generate_tech_logic(calculation_logic)
+            st.session_state[tech_calc_key] = calculation_logic
+
+        tech_logic = detail_right.text_area(
+            "Tech Logic",
+            disabled=locked,
+            height=145,
+            key=tech_key,
+            help=(
+                "Auto-populated from Calculation Logic. Example: "
+                "Total Income(PRJ362) = EBITDA(PRJ43843) - Debt(PRJ4343) "
+                "becomes PRJ362 = PRJ43843-PRJ4343. You can adjust it before saving."
+            ),
+        )
+        examples = st.text_area(
+            "Examples (Prompt Management)",
+            value=str(rule.get("examples") or ""),
+            disabled=locked,
+            height=80,
+            key=f"{prefix}_examples",
+        )
+
     c1, c2 = st.columns(2)
     display_order = c1.number_input("Display Order *", min_value=0, value=int(rule.get("display_order") or 0), step=1, disabled=locked, key=f"{prefix}_order")
     display_name = c2.text_input("Display Name", value=str(rule.get("display_name") or detail.get("prj_attribute_name") or ""), disabled=locked, key=f"{prefix}_display")
-    examples = st.text_area("Examples (Prompt Management)", value=str(rule.get("examples") or ""), disabled=locked, height=80, key=f"{prefix}_examples")
 
     if locked:
         return None
-    submitted = st.button("Create Attribute" if not detail else "Save Changes", type="primary", key=f"{prefix}_submit")
+    submitted = st.button(
+        "Create Attribute" if not detail else "Save Changes",
+        type="primary",
+        key=f"{prefix}_submit",
+        width="stretch",
+    )
     if not submitted:
         return None
     if not prj_id:
@@ -646,26 +715,46 @@ with main_tabs[0]:
                     "prj_physical_attribute_name", "portfolios", "sources",
                     "section", "subsection", "is_active",
                 ]
-                st.dataframe(
-                    deleted_frame[[column for column in deleted_columns if column in deleted_frame.columns]],
+                deleted_visible_frame = deleted_frame[
+                    [column for column in deleted_columns if column in deleted_frame.columns]
+                ].reset_index(drop=True)
+                deleted_grid_event = st.dataframe(
+                    deleted_visible_frame,
                     width="stretch",
                     hide_index=True,
-                    height=300,
+                    height=330,
+                    key="soft_deleted_grid",
+                    on_select="rerun",
+                    selection_mode="single-row",
                 )
-                deleted_ids = [str(row.get("prj_id")) for row in deleted_rows if row.get("prj_id")]
-                reactivate_prj = st.selectbox(
-                    "Select soft deleted attribute to reactivate",
-                    [""] + deleted_ids,
-                    key="soft_deleted_selected_prj",
+                deleted_selected_indexes = list(getattr(deleted_grid_event.selection, "rows", []) or [])
+                deleted_selected_row = (
+                    deleted_frame.iloc[deleted_selected_indexes[0]].to_dict()
+                    if deleted_selected_indexes
+                    else None
                 )
+                reactivate_prj = (
+                    str(deleted_selected_row.get("prj_id"))
+                    if deleted_selected_row and deleted_selected_row.get("prj_id")
+                    else ""
+                )
+                if reactivate_prj:
+                    st.caption(
+                        f"Selected soft-deleted attribute: {reactivate_prj} - "
+                        f"{deleted_selected_row.get('prj_attribute_name', '')}"
+                    )
                 if st.button(
                     "Reactivate Selected Soft Deleted Record",
                     disabled=not reactivate_prj,
                     key="reactivate_soft_deleted",
+                    type="primary",
                 ):
                     response = api("POST", f"/data-dictionary/attributes/{reactivate_prj}/reactivate")
                     if response:
-                        st.success("Reactivation staged. Review Delta, then Finalize and Upload.")
+                        st.session_state["audit_cache_rows"] = None
+                        st.success(
+                            "Reactivation staged. The record remains in this soft-deleted grid until Finalize and Upload completes."
+                        )
             else:
                 st.info("No finalized soft deleted records found.")
             st.divider()
@@ -1129,6 +1218,7 @@ if is_admin:
 
 if st.session_state.get("show_create") and create_modal.is_open():
     with create_modal.container():
+        render_attribute_modal_style("create_attribute_modal")
         payload = attribute_form("create")
         if payload:
             result = api("POST", "/data-dictionary/attributes", json=payload)
@@ -1156,6 +1246,7 @@ if st.session_state.get("show_edit") and edit_modal.is_open():
     selected_prj = st.session_state.get("selected_prj")
     detail = st.session_state.get("edit_detail")
     with edit_modal.container():
+        render_attribute_modal_style("edit_attribute_modal")
         if detail:
             payload = attribute_form("edit", detail, locked=False)
             if payload:

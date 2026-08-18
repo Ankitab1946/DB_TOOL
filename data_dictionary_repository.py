@@ -645,9 +645,9 @@ class DataDictionaryRepository:
             ),
             None,
         )
-        if target is None and len(existing) == 1 and not source_operation.upper().startswith("BULK_"):
+        if target is None and len(existing) == 1 and not strict_key and not source_operation.upper().startswith("BULK_"):
             target = existing[0]
-        if target is None and len(existing) > 1 and not source_operation.upper().startswith("BULK_"):
+        if target is None and len(existing) > 1 and not strict_key and not source_operation.upper().startswith("BULK_"):
             raise ValueError(
                 f"Cannot unambiguously update raw row for {row['prj_id']} / {row['portfolio']}; "
                 "multiple raw rows exist and the edited key no longer matches."
@@ -714,6 +714,7 @@ class DataDictionaryRepository:
         user: str,
         source_operation: str,
         cache: dict[tuple[str, int], list[StagingBusinessRule]],
+        strict_key: bool = False,
     ) -> dict[str, Any] | None:
         key = (str(row["prj_id"]), int(row["port_ref_id"]))
         existing = cache.setdefault(key, [])
@@ -727,9 +728,9 @@ class DataDictionaryRepository:
             ),
             None,
         )
-        if target is None and len(existing) == 1 and not source_operation.upper().startswith("BULK_"):
+        if target is None and len(existing) == 1 and not strict_key and not source_operation.upper().startswith("BULK_"):
             target = existing[0]
-        if target is None and len(existing) > 1 and not source_operation.upper().startswith("BULK_"):
+        if target is None and len(existing) > 1 and not strict_key and not source_operation.upper().startswith("BULK_"):
             raise ValueError(
                 f"Cannot unambiguously update staging rule for {row['prj_id']} / port_ref_id {row['port_ref_id']}; "
                 "multiple staged rules exist and the edited key no longer matches."
@@ -828,6 +829,7 @@ class DataDictionaryRepository:
         user: str,
         source_operation: str,
         defer_insert_audit: bool = False,
+        strict_key: bool = False,
     ) -> dict[str, Any] | None:
         existing = list(self.db.scalars(
             select(StagingBusinessRule)
@@ -844,9 +846,9 @@ class DataDictionaryRepository:
             ),
             None,
         )
-        if target is None and len(existing) == 1 and not source_operation.upper().startswith("BULK_"):
+        if target is None and len(existing) == 1 and not strict_key and not source_operation.upper().startswith("BULK_"):
             target = existing[0]
-        if target is None and len(existing) > 1 and not source_operation.upper().startswith("BULK_"):
+        if target is None and len(existing) > 1 and not strict_key and not source_operation.upper().startswith("BULK_"):
             raise ValueError(
                 f"Cannot unambiguously update staging rule for {row['prj_id']} / port_ref_id {row['port_ref_id']}; "
                 "multiple staged rules exist and the edited key no longer matches."

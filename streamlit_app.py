@@ -152,6 +152,7 @@ for key, default in {
     "show_soft_deleted": False,
     "database_status_key": "",
     "database_status": None,
+    "flash_message": None,
 }.items():
     st.session_state.setdefault(key, default)
 
@@ -253,8 +254,8 @@ source_by_code = {item.get("source_code"): item.get("source_name") for item in l
 def source_label(code: str) -> str:
     return f"{code}[{source_by_code.get(code, code)}]"
 
-create_modal = Modal("Create New Attribute", key="create_attribute_modal", max_width=1220)
-edit_modal = Modal("Edit Attribute", key="edit_attribute_modal", max_width=1220)
+create_modal = Modal("Create New Attribute", key="create_attribute_modal", max_width=1450)
+edit_modal = Modal("Edit Attribute", key="edit_attribute_modal", max_width=1450)
 finalize_modal = Modal("Finalize and Upload", key="finalize_modal", max_width=720)
 
 
@@ -357,12 +358,19 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     display_order = c1.number_input("Display Order *", min_value=0, value=int(rule.get("display_order") or 0), step=1, disabled=locked, key=f"{prefix}_order")
     display_name = c2.text_input("Display Name", value=str(rule.get("display_name") or detail.get("prj_attribute_name") or ""), disabled=locked, key=f"{prefix}_display")
     tech_preview = str(rule.get("tech_logic") or generate_tech_logic(calculation_logic))
-    st.text_area("Tech Logic (read only; auto-generated)", value=tech_preview, disabled=True, height=90, key=f"{prefix}_tech")
+    tech_logic = st.text_area(
+        "Tech Logic",
+        value=tech_preview,
+        disabled=locked,
+        height=120,
+        key=f"{prefix}_tech",
+        help="Auto-populated from Calculation Logic when blank; it can be updated before saving.",
+    )
     examples = st.text_area("Examples (Prompt Management)", value=str(rule.get("examples") or ""), disabled=locked, height=80, key=f"{prefix}_examples")
 
     if locked:
         return None
-    submitted = st.button("Create Attribute" if not detail else "Upload Changes", type="primary", key=f"{prefix}_submit")
+    submitted = st.button("Create Attribute" if not detail else "Save Changes", type="primary", key=f"{prefix}_submit")
     if not submitted:
         return None
     if not attribute_name.strip() or not section.strip() or not subsection.strip():
@@ -383,6 +391,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         "segment": segment or "NA",
         "attribute_definition": attribute_definition or None,
         "attribute_description": attribute_description or None,
+        "tech_logic": tech_logic or None,
         "display_order": int(display_order),
         "display_name": display_name or attribute_name,
         "examples": examples or None,
@@ -393,6 +402,9 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
 is_admin = bool(refreshed.get("is_admin"))
 main_tab_labels = ["Data Dictionary", "Prompt Management", "Audit"] + (["Admin Tools"] if is_admin else [])
 main_tabs = st.tabs(main_tab_labels)
+
+if st.session_state.get("flash_message"):
+    st.success(st.session_state.pop("flash_message"))
 
 with main_tabs[0]:
     workflow_labels = ["View / Edit Latest"] + (["Upload & Edit"] if is_admin else []) + ["Finalize and Upload"]
@@ -514,160 +526,44 @@ with main_tabs[0]:
                 "editable", "symbol", "portfolios", "sources", "section", "subsection", "is_active",
             ]
             frame = pd.DataFrame(rows)
-            st.dataframe(frame[[c for c in grid_columns if c in frame.columns]], use_container_width=True, hide_index=True, height=430)
-            options = [str(row.get("prj_id")) for row in rows]
-            selected_prj = st.selectbox("Select one attribute for an action", [""] + options, key="view_selected_prj")
-            action1, action2, action3 = st.columns(3)
-            if action1.button("Edit Selected", disabled=not selected_prj, use_container_width=True):
+            visible_frame = frame[[c for c in grid_columns if c in frame.columns]].reset_index(drop=True)
+            grid_event = st.dataframe(
+                visible_frame,
+                use_container_width=True,
+                hide_index=True,
+                height=430,
+                key="view_latest_grid",
+                on_select="rerun",
+                selection_mode="single-row",
+            )
+            selected_indexes = list(getattr(grid_event.selection, "rows", []) or [])
+            selected_row = frame.iloc[selected_indexes[0]].to_dict() if selected_indexes else None
+            selected_prj = str(selected_row.get("prj_id")) if selected_row and selected_row.get("prj_id") else ""
+            if selected_prj:
+                st.caption(f"Selected attribute: {selected_prj} - {selected_row.get('prj_attribute_name', '')}")
+
+            action1, action2, action3, _ = st.columns([1.2, 1.2, 1.2, 4])
+            if action1.button("Edit", disabled=not selected_prj, use_container_width=True):
                 st.session_state["selected_prj"] = selected_prj
                 st.session_state["show_edit"] = True
-                st.session_state["edit_unlocked"] = False
+                st.session_state["edit_unlocked"] = True
                 edit_modal.open()
             if action2.button("Soft Delete", disabled=not selected_prj, use_container_width=True):
                 response = api("DELETE", f"/data-dictionary/attributes/{selected_prj}")
                 if response:
-                    st.success("Soft delete staged. Review Delta, then Finalize and Upload.")
+                    st.session_state["flash_message"] = (
+                        f"{selected_prj} soft delete staged successfully. Review Delta, then Finalize and Upload."
+                    )
+                    st.rerun()
             if action3.button("Reactivate", disabled=not selected_prj, use_container_width=True):
                 response = api("POST", f"/data-dictionary/attributes/{selected_prj}/reactivate")
                 if response:
-                    st.success("Reactivation staged. Review Delta, then Finalize and Upload.")
+                    st.session_state["flash_message"] = (
+                        f"{selected_prj} reactivation staged successfully. Review Delta, then Finalize and Upload."
+                    )
+                    st.rerun()
         else:
             st.info("No records loaded for the selected filters.")
-
-        st.divider()
-        st.subheader("Edit Latest")
-        st.caption(
-            "Existing PRJ_ID values are read-only. New grid rows receive a PRJ_ID from the API. "
-            "Set Is Active to false for a soft delete; all changes remain staged until finalization."
-        )
-        edit_rows = api("GET", "/data-dictionary/edit-latest?include_deleted=true", quiet=True) or []
-        if edit_rows:
-            all_edit = pd.DataFrame(edit_rows)
-            q1, q2, q3 = st.columns([3, 1, 1])
-            edit_search = q1.text_input("Search Edit Latest", key="edit_latest_search")
-            edit_page_size = int(q2.selectbox("Rows per page", [25, 50, 100, 250], index=1, key="edit_page_size"))
-            if edit_search:
-                needle = edit_search.lower()
-                mask = all_edit.apply(
-                    lambda row: needle in " ".join(str(value).lower() for value in row.values), axis=1
-                )
-                filtered_edit = all_edit[mask].copy()
-            else:
-                filtered_edit = all_edit.copy()
-            max_page = max(1, (len(filtered_edit) + edit_page_size - 1) // edit_page_size)
-            edit_page = int(q3.number_input("Page", min_value=1, max_value=max_page, value=1, step=1, key="edit_page"))
-            page_start = (edit_page - 1) * edit_page_size
-            page_frame = filtered_edit.iloc[page_start: page_start + edit_page_size].copy()
-
-            display_columns = [
-                "scope_id", "prj_id", "portfolio", "source_abbr_name", "prj_attribute_name",
-                "prj_physical_attribute_name", "section", "sub_section", "data_type", "calculated_or_reported",
-                "calculation_logic", "segment", "prj_attribute_definition", "attribute_description",
-                "display_order", "display_name", "prompt_description", "examples", "is_active",
-            ]
-            for column in display_columns:
-                if column not in page_frame.columns:
-                    page_frame[column] = None
-            editor_df = page_frame[display_columns].reset_index(drop=True)
-            edited = st.data_editor(
-                editor_df,
-                use_container_width=True,
-                hide_index=True,
-                height=500,
-                disabled=["scope_id", "prj_id"],
-                num_rows="dynamic",
-                key=f"edit_latest_grid_{edit_page}_{edit_search}",
-            )
-
-            original_by_scope = {
-                int(row["scope_id"]): row
-                for _, row in editor_df.iterrows()
-                if pd.notna(row.get("scope_id"))
-            }
-            dirty_rows: list[dict[str, Any]] = []
-            new_rows: list[dict[str, Any]] = []
-            for _, row_series in edited.iterrows():
-                row = row_series.to_dict()
-                scope_value = row.get("scope_id")
-                if pd.isna(scope_value):
-                    if any(pd.notna(value) and str(value).strip() for key, value in row.items() if key != "is_active"):
-                        new_rows.append(row)
-                    continue
-                scope_id = int(scope_value)
-                original_row = original_by_scope.get(scope_id)
-                if original_row is None:
-                    continue
-                changed = any(
-                    str("" if pd.isna(original_row.get(column)) else original_row.get(column))
-                    != str("" if pd.isna(row.get(column)) else row.get(column))
-                    for column in display_columns
-                    if column not in {"scope_id", "prj_id"}
-                )
-                if changed:
-                    dirty_rows.append(row)
-
-            removed_scope_ids = set(original_by_scope) - {
-                int(value) for value in edited["scope_id"].dropna().tolist()
-            }
-            if removed_scope_ids:
-                st.warning(
-                    "Rows removed with the grid delete control are not staged automatically. "
-                    "Use Is Active = false or the Soft Delete action so deletion is explicit and auditable."
-                )
-            dirty_count = len(dirty_rows) + len(new_rows)
-            st.caption(
-                f"Showing {len(editor_df)} of {len(filtered_edit)} rows. Pending grid changes: "
-                f"{len(dirty_rows)} existing + {len(new_rows)} new."
-            )
-
-            def grid_payload(row: dict[str, Any], *, existing: bool) -> dict[str, Any]:
-                def clean(value, default=None):
-                    if value is None or (isinstance(value, float) and pd.isna(value)):
-                        return default
-                    text = str(value).strip()
-                    return text if text else default
-
-                return {
-                    "prj_id": clean(row.get("prj_id")) if existing else None,
-                    "portfolio": clean(row.get("portfolio"), "") or "",
-                    "source_abbr_name": clean(row.get("source_abbr_name"), "SNPAR"),
-                    "prj_attribute_name": clean(row.get("prj_attribute_name"), "") or "",
-                    "prj_physical_attribute_name": clean(row.get("prj_physical_attribute_name")),
-                    "section": clean(row.get("section"), "") or "",
-                    "sub_section": clean(row.get("sub_section"), "") or "",
-                    "data_type": clean(row.get("data_type")),
-                    "calculated_or_reported": clean(row.get("calculated_or_reported"), "Reported"),
-                    "calculation_logic": clean(row.get("calculation_logic"), "NA"),
-                    "segment": clean(row.get("segment"), "NA"),
-                    "attribute_definition": clean(row.get("prj_attribute_definition")),
-                    "attribute_description": clean(row.get("attribute_description")),
-                    "display_order": int(float(0 if pd.isna(row.get("display_order")) else row.get("display_order") or 0)),
-                    "display_name": clean(row.get("display_name"), clean(row.get("prj_attribute_name"), "")),
-                    "prompt_description": clean(row.get("prompt_description")),
-                    "examples": clean(row.get("examples")),
-                    "is_active": bool(row.get("is_active", True)),
-                }
-
-            if st.button(
-                "Stage Grid Changes",
-                type="primary",
-                disabled=dirty_count == 0,
-            ):
-                success = 0
-                for row in dirty_rows:
-                    payload = grid_payload(row, existing=True)
-                    response = api("PUT", f"/data-dictionary/attributes/{payload['prj_id']}", json=payload)
-                    if response:
-                        success += 1
-                for row in new_rows:
-                    payload = grid_payload(row, existing=False)
-                    response = api("POST", "/data-dictionary/attributes", json=payload)
-                    if response:
-                        success += 1
-                if success:
-                    st.success(f"{success} row(s) staged. Review the delta before finalization.")
-        else:
-            st.info("No final records available for editing.")
 
     if is_admin and upload_tab is not None:
         with upload_tab:
@@ -930,8 +826,9 @@ if st.session_state.get("show_create"):
                 result = api("POST", "/data-dictionary/attributes", json=payload)
                 if result:
                     staged_tables = ", ".join(result.get("staged_tables", []))
-                    st.success(
-                        f"{result.get('prj_id')} staged successfully. "
+                    generated_id = result.get("cfv_id") or result.get("prj_id")
+                    st.session_state["flash_message"] = (
+                        f"CFV ID generated: {generated_id}. Attribute staged successfully. "
                         f"Physical name: {result.get('prj_physical_attribute_name')}. "
                         f"Saved to: {staged_tables}"
                     )
@@ -951,21 +848,17 @@ if st.session_state.get("show_edit"):
     if edit_modal.is_open():
         with edit_modal.container():
             if detail:
-                if not st.session_state.get("edit_unlocked"):
-                    attribute_form("edit_locked", detail, locked=True)
-                    if st.button("Edit", type="primary", key="unlock_edit"):
-                        st.session_state["edit_unlocked"] = True
+                payload = attribute_form("edit", detail, locked=False)
+                if payload:
+                    result = api("PUT", f"/data-dictionary/attributes/{selected_prj}", json=payload)
+                    if result:
+                        st.session_state["flash_message"] = (
+                            f"{selected_prj} changes staged successfully. Review the delta before finalization."
+                        )
+                        st.session_state["show_edit"] = False
+                        st.session_state["edit_unlocked"] = False
+                        edit_modal.close()
                         st.rerun()
-                else:
-                    payload = attribute_form("edit", detail, locked=False)
-                    if payload:
-                        result = api("PUT", f"/data-dictionary/attributes/{selected_prj}", json=payload)
-                        if result:
-                            st.success("Changes staged. Review the delta before finalization.")
-                            st.session_state["show_edit"] = False
-                            st.session_state["edit_unlocked"] = False
-                            edit_modal.close()
-                            st.rerun()
             if st.button("Close", key="edit_close"):
                 st.session_state["show_edit"] = False
                 st.session_state["edit_unlocked"] = False

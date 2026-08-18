@@ -16,6 +16,25 @@ from DataDictionaryAdminApp.service.excel_service import STANDARD_FIELDS
 from DataDictionaryAdminApp.utils.normalizers import canonical_portfolio_label, generate_physical_name, generate_tech_logic, pair_pipe_values, portfolio_from_sheet_name
 
 
+class StateAwareModal(Modal):
+    """Modal that synchronizes the application-level open flag on every close.
+
+    ``streamlit-modal`` keeps its own ``<key>-opened`` flag.  Create/Edit also
+    have application flags (``show_create``/``show_edit``).  If the built-in
+    X only closes the library flag while the application flag stays True, the
+    next rerun can reopen the modal.  Keeping both flags synchronized makes X
+    dismissal immediate and prevents the modal from being reconstructed.
+    """
+
+    def __init__(self, title: str, key: str, *, state_flag: str, padding: int = 20, max_width: int = 744):
+        super().__init__(title, key=key, padding=padding, max_width=max_width)
+        self.state_flag = state_flag
+
+    def close(self, rerun_condition: bool = True):
+        st.session_state[self.state_flag] = False
+        return super().close(rerun_condition=rerun_condition)
+
+
 def load_env() -> None:
     candidates = [Path.cwd() / ".env", *[parent / ".env" for parent in Path(__file__).resolve().parents]]
     for path in candidates:
@@ -50,6 +69,15 @@ st.markdown(
 .stTabs [aria-selected="true"] { background:#dceafa !important; border-color:#86a7c8 !important; }
 [data-testid="stDataFrame"], [data-testid="stDataEditor"] { border:1px solid #c6d6e5; border-radius:6px; overflow:hidden; }
 .small-note { color:#5b6f84; font-size:.84rem; }
+/* Center the large Create/Edit modals in the browser viewport.  The modal
+   package already centers horizontally; top/transform completes viewport
+   centering without changing its scrolling or width behavior. */
+div[data-modal-container='true'][key='create_attribute_modal'],
+div[data-modal-container='true'][key='edit_attribute_modal'] {
+    top: 50% !important;
+    bottom: auto !important;
+    transform: translateY(-50%) !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -92,6 +120,11 @@ def api(method: str, path: str, *, quiet: bool = False, binary: bool = False, **
             st.error(f"API error {response.status_code}: {detail}")
         return None
     return response if binary else response.json()
+
+
+def request_prj_filter_submit() -> None:
+    """Request an immediate View Latest refresh when PRJ_ID is committed with Enter."""
+    st.session_state["prj_filter_submit_requested"] = True
 
 
 def database_status_check() -> dict[str, Any]:
@@ -144,6 +177,7 @@ for key, default in {
     "view_total": 0,
     "view_loaded": False,
     "view_filter_signature": "",
+    "prj_filter_submit_requested": False,
     "selected_prj": "",
     "edit_detail": None,
     "upload_preview": None,
@@ -172,6 +206,8 @@ for key, default in {
     "edit_unlocked": False,
     "show_finalize_confirm": False,
     "show_soft_deleted": False,
+    "show_cleanup": False,
+    "cleanup_step": 0,
     "database_status_key": "",
     "database_status": None,
     "flash_message": None,
@@ -304,9 +340,20 @@ source_by_code = {item.get("source_code"): item.get("source_name") for item in l
 def source_label(code: str) -> str:
     return f"{code}[{source_by_code.get(code, code)}]"
 
-create_modal = Modal("Create New Attribute", key="create_attribute_modal", max_width=1650)
-edit_modal = Modal("Edit Attribute", key="edit_attribute_modal", max_width=1650)
+create_modal = StateAwareModal(
+    "Create New Attribute",
+    key="create_attribute_modal",
+    state_flag="show_create",
+    max_width=1650,
+)
+edit_modal = StateAwareModal(
+    "Edit Attribute",
+    key="edit_attribute_modal",
+    state_flag="show_edit",
+    max_width=1650,
+)
 finalize_modal = Modal("Finalize and Upload", key="finalize_modal", max_width=720)
+cleanup_modal = Modal("Cleanup Database", key="cleanup_database_modal", max_width=980)
 
 
 def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bool = False) -> dict[str, Any] | None:
@@ -512,7 +559,11 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
 
 
 is_admin = bool(refreshed.get("is_admin"))
-modal_active = bool(st.session_state.get("show_create") or st.session_state.get("show_edit"))
+modal_active = bool(
+    st.session_state.get("show_create")
+    or st.session_state.get("show_edit")
+    or st.session_state.get("show_cleanup")
+)
 main_tab_labels = ["Data Dictionary", "Prompt Management", "Audit"] + (["Admin Tools"] if is_admin else [])
 main_tabs = st.tabs(main_tab_labels)
 
@@ -531,7 +582,12 @@ with main_tabs[0]:
         f1, f2, f3, f4 = st.columns(4)
         portfolios = f1.multiselect("Portfolio", portfolio_labels)
         sources = f2.multiselect("Source", source_options, format_func=source_label)
-        prj_filter = f3.text_input("PRJ_ID")
+        prj_filter = f3.text_input(
+            "PRJ_ID",
+            key="view_prj_id_filter",
+            on_change=request_prj_filter_submit,
+            help="Enter a PRJ_ID and press Enter to refresh View Latest immediately.",
+        )
         name_filter = f4.text_input("Attribute Name")
         f1, f2, f3, f4 = st.columns(4)
         definition_filter = f1.text_input("Attribute Definition")
@@ -615,6 +671,19 @@ with main_tabs[0]:
             st.divider()
 
         filter_signature = json.dumps(payload, sort_keys=True, default=str)
+
+        # PRJ_ID is the fast exact-search path. Committing the text input with
+        # Enter triggers its on_change callback and refreshes the grid immediately,
+        # without requiring a second click on View Latest.
+        if st.session_state.get("prj_filter_submit_requested"):
+            result = api("POST", "/data-dictionary/filter-page", json=payload)
+            st.session_state["prj_filter_submit_requested"] = False
+            if result:
+                st.session_state["view_rows"] = result.get("rows", [])
+                st.session_state["view_total"] = result.get("total", 0)
+                st.session_state["view_filter_signature"] = filter_signature
+                st.session_state["view_loaded"] = True
+
         if not st.session_state.get("view_loaded"):
             result = api("POST", "/data-dictionary/filter-page", json=payload, quiet=True)
             if result:
@@ -1036,6 +1105,20 @@ if is_admin:
                     st.session_state["admin_portfolios_cache"] = None
                     st.session_state["audit_cache_rows"] = None
                     st.success(f"Created port_ref_id {result.get('port_ref_id')}")
+        st.divider()
+        st.markdown("#### Database Cleanup")
+        st.warning(
+            "Cleanup permanently hard-deletes Data Dictionary raw, staging, final and audit rows "
+            "for the currently selected Environment/Database. The four required Portfolio seed rows and the read-only Source reference table are preserved."
+        )
+        if st.button("Cleanup Database", key="open_cleanup_database", width="stretch"):
+            st.session_state["show_cleanup"] = True
+            st.session_state["cleanup_step"] = 1
+            st.session_state.pop("cleanup_confirmation_text", None)
+            st.session_state.pop("cleanup_irreversible_ack", None)
+            cleanup_modal.open()
+            st.rerun()
+
         st.markdown("#### Deployment")
         st.code("poetry run uvicorn DataDictionaryAdminApp.api.swagger_app:app --host 0.0.0.0 --port 8503")
         st.code("poetry run streamlit run src/DataDictionaryAdminApp/streamlit_app.py --server.port 8501")
@@ -1044,66 +1127,144 @@ if is_admin:
         else:
             st.caption("Run sql/001_create_tables.sql, then sql/002_validate_schema.sql before enabling SQL Server writes.")
 
-if st.session_state.get("show_create"):
-    if not create_modal.is_open():
-        create_modal.open()
-    if create_modal.is_open():
-        with create_modal.container():
-            payload = attribute_form("create")
-            if payload:
-                result = api("POST", "/data-dictionary/attributes", json=payload)
-                if result:
-                    staged_tables = ", ".join(result.get("staged_tables", []))
-                    generated_id = result.get("cfv_id") or result.get("prj_id")
-                    st.session_state["flash_message"] = (
-                        f"CFV ID generated: {generated_id}. Attribute staged successfully. "
-                        f"Physical name: {result.get('prj_physical_attribute_name')}. "
-                        f"Saved to: {staged_tables}"
-                    )
-                    st.session_state["show_create"] = False
-                    st.session_state["audit_cache_rows"] = None
-                    st.session_state["prompts_cache"] = None
-                    st.session_state.pop("create_next_prj_id", None)
-                    st.session_state.pop("create_prj", None)
-                    st.session_state.pop("create_physical_suggestion", None)
-                    create_modal.close()
-                    st.rerun()
-            if st.button("Close", key="create_close"):
-                st.session_state["show_create"] = False
+if st.session_state.get("show_create") and create_modal.is_open():
+    with create_modal.container():
+        payload = attribute_form("create")
+        if payload:
+            result = api("POST", "/data-dictionary/attributes", json=payload)
+            if result:
+                staged_tables = ", ".join(result.get("staged_tables", []))
+                generated_id = result.get("cfv_id") or result.get("prj_id")
+                st.session_state["flash_message"] = (
+                    f"CFV ID generated: {generated_id}. Attribute staged successfully. "
+                    f"Physical name: {result.get('prj_physical_attribute_name')}. "
+                    f"Saved to: {staged_tables}"
+                )
+                st.session_state["audit_cache_rows"] = None
+                st.session_state["prompts_cache"] = None
                 st.session_state.pop("create_next_prj_id", None)
                 st.session_state.pop("create_prj", None)
                 st.session_state.pop("create_physical_suggestion", None)
                 create_modal.close()
-                st.rerun()
+        if st.button("Close", key="create_close"):
+            st.session_state.pop("create_next_prj_id", None)
+            st.session_state.pop("create_prj", None)
+            st.session_state.pop("create_physical_suggestion", None)
+            create_modal.close()
 
-if st.session_state.get("show_edit"):
+if st.session_state.get("show_edit") and edit_modal.is_open():
     selected_prj = st.session_state.get("selected_prj")
     detail = st.session_state.get("edit_detail")
-    if not edit_modal.is_open():
-        edit_modal.open()
-    if edit_modal.is_open():
-        with edit_modal.container():
-            if detail:
-                payload = attribute_form("edit", detail, locked=False)
-                if payload:
-                    result = api("PUT", f"/data-dictionary/attributes/{selected_prj}", json=payload)
+    with edit_modal.container():
+        if detail:
+            payload = attribute_form("edit", detail, locked=False)
+            if payload:
+                result = api("PUT", f"/data-dictionary/attributes/{selected_prj}", json=payload)
+                if result:
+                    st.session_state["flash_message"] = (
+                        f"{selected_prj} changes staged successfully. Review the delta before finalization."
+                    )
+                    st.session_state["audit_cache_rows"] = None
+                    st.session_state["prompts_cache"] = None
+                    st.session_state["edit_unlocked"] = False
+                    st.session_state["edit_detail"] = None
+                    edit_modal.close()
+        if st.button("Close", key="edit_close"):
+            st.session_state["edit_unlocked"] = False
+            st.session_state["edit_detail"] = None
+            edit_modal.close()
+
+if st.session_state.get("show_cleanup"):
+    if not cleanup_modal.is_open():
+        cleanup_modal.open()
+    if cleanup_modal.is_open():
+        with cleanup_modal.container():
+            selected_environment = st.session_state.get("environment", "LOCAL")
+            selected_database_type = st.session_state.get("database_type", "SQLSERVER")
+            selected_database_name = str((st.session_state.get("runtime_context") or {}).get("database", "Unknown"))
+            st.error("Destructive operation: hard delete")
+            st.write(
+                f"**Environment:** {selected_environment}  |  "
+                f"**Database Type:** {selected_database_type}  |  "
+                f"**Database:** {selected_database_name}"
+            )
+            st.caption(
+                "The following data is permanently deleted: raw attributes, staging master/rules, "
+                "final master/rules, audit history and custom Portfolio rows. Required Portfolio seed rows (IDs 1-4) and Data Sources are preserved."
+            )
+
+            if int(st.session_state.get("cleanup_step", 1)) == 1:
+                st.markdown("### Confirmation 1 of 2")
+                st.warning(
+                    "This cannot be undone from the application. Confirm that you want to continue to the final cleanup confirmation."
+                )
+                c1, c2 = st.columns(2)
+                if c1.button("Yes, continue", key="cleanup_first_confirm", type="primary", width="stretch"):
+                    st.session_state["cleanup_step"] = 2
+                    st.rerun()
+                if c2.button("Cancel", key="cleanup_cancel_first", width="stretch"):
+                    st.session_state["show_cleanup"] = False
+                    st.session_state["cleanup_step"] = 0
+                    cleanup_modal.close()
+                    st.rerun()
+            else:
+                st.markdown("### Confirmation 2 of 2")
+                st.error("Final confirmation: type **DELETE ALL DATA** exactly, then acknowledge the irreversible delete.")
+                confirmation_text = st.text_input(
+                    "Type DELETE ALL DATA",
+                    key="cleanup_confirmation_text",
+                    placeholder="DELETE ALL DATA",
+                )
+                irreversible_ack = st.checkbox(
+                    "I understand this permanently hard-deletes the selected database's dictionary data.",
+                    key="cleanup_irreversible_ack",
+                )
+                valid_confirmation = confirmation_text.strip().upper() == "DELETE ALL DATA" and irreversible_ack
+                c1, c2 = st.columns(2)
+                if c1.button(
+                    "Permanently Delete Data",
+                    key="cleanup_final_confirm",
+                    type="primary",
+                    disabled=not valid_confirmation,
+                    width="stretch",
+                ):
+                    result = api(
+                        "POST",
+                        "/system/cleanup",
+                        json={
+                            "first_confirmation": True,
+                            "second_confirmation": True,
+                            "confirmation_text": confirmation_text,
+                        },
+                    )
                     if result:
-                        st.session_state["flash_message"] = (
-                            f"{selected_prj} changes staged successfully. Review the delta before finalization."
-                        )
-                        st.session_state["show_edit"] = False
-                        st.session_state["audit_cache_rows"] = None
-                        st.session_state["prompts_cache"] = None
-                        st.session_state["edit_unlocked"] = False
+                        deleted_total = int(result.get("deleted_total", 0))
+                        st.session_state["view_rows"] = []
+                        st.session_state["view_total"] = 0
+                        st.session_state["view_loaded"] = False
+                        st.session_state["selected_prj"] = ""
                         st.session_state["edit_detail"] = None
-                        edit_modal.close()
+                        st.session_state["upload_preview"] = None
+                        st.session_state["upload_stage_result"] = None
+                        st.session_state["prompts_cache"] = None
+                        st.session_state["audit_cache_rows"] = None
+                        st.session_state["soft_deleted_cache"] = None
+                        st.session_state["show_soft_deleted"] = False
+                        st.session_state["lookup_cache"] = None
+                        st.session_state["show_cleanup"] = False
+                        st.session_state["cleanup_step"] = 0
+                        st.session_state["flash_message"] = (
+                            f"Database cleanup completed. {deleted_total} row(s) were permanently deleted. "
+                            "Required Portfolio seed rows (IDs 1-4) and Data Sources were preserved."
+                        )
+                        cleanup_modal.close()
                         st.rerun()
-            if st.button("Close", key="edit_close"):
-                st.session_state["show_edit"] = False
-                st.session_state["edit_unlocked"] = False
-                st.session_state["edit_detail"] = None
-                edit_modal.close()
-                st.rerun()
+                if c2.button("Cancel", key="cleanup_cancel_final", width="stretch"):
+                    st.session_state["show_cleanup"] = False
+                    st.session_state["cleanup_step"] = 0
+                    cleanup_modal.close()
+                    st.rerun()
+
 
 if finalize_modal.is_open():
     with finalize_modal.container():

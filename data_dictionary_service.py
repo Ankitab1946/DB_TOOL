@@ -24,6 +24,7 @@ from DataDictionaryAdminApp.utils.normalizers import (
     generate_physical_name,
     generate_tech_logic,
     mapping_type_from_value,
+    normalize_pipe_values,
     normalize_text,
 )
 
@@ -58,6 +59,86 @@ class DataDictionaryService:
     def __init__(self, db: Session):
         self.db = db
         self.repo = DataDictionaryRepository(db)
+        self._portfolio_cache: dict[str, dict[str, Any]] | None = None
+        self._source_name_cache: dict[str, str] | None = None
+        self._source_code_cache: set[str] | None = None
+        self._original_type_cache: dict[str, str | None] | None = None
+        self._physical_owner_cache: dict[str, str] | None = None
+        self._physical_by_prj_cache: dict[str, str] | None = None
+
+    def prepare_bulk_cache(self, payloads: list[AttributeUpsert]) -> None:
+        """Preload stable reference/uniqueness data once for large workbook operations."""
+        portfolios = self.repo.list_portfolios(True)
+        self._portfolio_cache = {str(row["label"]).casefold(): row for row in portfolios}
+        if self.repo.source_table_name() is None:
+            # Preserve the existing fallback behavior when the external read-only
+            # source table is not available in a local/test environment.
+            self._source_name_cache = None
+            self._source_code_cache = None
+        else:
+            sources = self.repo.list_sources()
+            self._source_name_cache = {str(row.get("source_name") or "").casefold(): str(row.get("source_code") or "") for row in sources}
+            self._source_code_cache = {str(row.get("source_code") or "").casefold() for row in sources if row.get("source_code")}
+        prj_ids = {str(item.prj_id) for item in payloads if item.prj_id}
+        self._original_type_cache = self.repo.preload_original_mapping_types(prj_ids)
+        self._physical_owner_cache, self._physical_by_prj_cache = self.repo.preload_physical_names()
+
+    def _portfolio_ref_cached(self, value: str) -> dict[str, Any] | None:
+        label = canonical_portfolio_label(value)
+        if self._portfolio_cache is not None:
+            return self._portfolio_cache.get(label.casefold())
+        return self.repo.portfolio_ref(label)
+
+    def _source_code_cached(self, source_name: str | None, source_abbr_name: str | None) -> str:
+        if self._source_name_cache is None or self._source_code_cache is None:
+            return self.repo.source_code(source_name, source_abbr_name)
+        requested = normalize_text(source_abbr_name)
+        if requested:
+            if requested.casefold() == "snpar":
+                return "SNPAR"
+            if requested.casefold() not in self._source_code_cache:
+                raise ValueError(f"Unknown source code: {requested}")
+            # Preserve the canonical DB spelling from the source list.
+            for name, code in self._source_name_cache.items():
+                if code.casefold() == requested.casefold():
+                    return code
+            return requested
+        if not source_name:
+            return "SNPAR"
+        code = self._source_name_cache.get(str(source_name).casefold())
+        if not code:
+            raise ValueError(f"Unknown source name: {source_name}")
+        return code
+
+    def _original_mapping_type_cached(self, prj_id: str) -> str | None:
+        if self._original_type_cache is not None:
+            return self._original_type_cache.get(prj_id)
+        return self.repo.original_mapping_type(prj_id)
+
+    def _physical_name_cached(self, prj_id: str) -> str | None:
+        if self._physical_by_prj_cache is not None:
+            return self._physical_by_prj_cache.get(prj_id)
+        return self.repo.physical_name_for_prj(prj_id)
+
+    def _physical_exists_cached(self, name: str, exclude_prj_id: str | None = None) -> bool:
+        if self._physical_owner_cache is None:
+            return self.repo.physical_name_exists(name, exclude_prj_id=exclude_prj_id)
+        owner = self._physical_owner_cache.get(name.casefold())
+        return bool(owner and owner != exclude_prj_id)
+
+    def _available_physical_cached(self, base_name: str, prj_id: str) -> str:
+        if self._physical_owner_cache is None:
+            return self.repo.available_physical_name(base_name, exclude_prj_id=prj_id)
+        base = base_name.strip() or "attribute"
+        for suffix in range(1, 10001):
+            candidate = base if suffix == 1 else f"{base[:500-len(str(suffix))-1]} {suffix}"
+            owner = self._physical_owner_cache.get(candidate.casefold())
+            if not owner or owner == prj_id:
+                self._physical_owner_cache[candidate.casefold()] = prj_id
+                if self._physical_by_prj_cache is not None:
+                    self._physical_by_prj_cache[prj_id] = candidate
+                return candidate
+        raise ValueError(f"Could not generate a unique PRJ Physical Attribute Name from '{base}'.")
 
     def next_prj_id(self) -> str:
         return self.repo.next_prj_id()
@@ -90,15 +171,15 @@ class DataDictionaryService:
         return self.repo.soft_deleted_rows()
 
     def detail(self, prj_id: str) -> dict[str, Any]:
-        detail = self.repo.final_detail(prj_id)
+        detail = self.repo.working_detail(prj_id)
         if not detail:
-            raise HTTPException(status_code=404, detail=f"PRJ ID {prj_id} was not found in the final dictionary.")
+            raise HTTPException(status_code=404, detail=f"PRJ ID {prj_id} was not found in staging or the final dictionary.")
         return detail
 
     def _make_rows(self, payload: AttributeUpsert) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         prj_id = normalize_text(payload.prj_id) or self.repo.next_prj_id()
         portfolio_label = canonical_portfolio_label(payload.portfolio)
-        portfolio = self.repo.portfolio_ref(portfolio_label)
+        portfolio = self._portfolio_ref_cached(portfolio_label)
         if not portfolio:
             raise HTTPException(status_code=422, detail=f"Unknown or inactive portfolio/scope: {payload.portfolio}")
 
@@ -108,7 +189,7 @@ class DataDictionaryService:
         if auto_physical:
             # Blank bulk/UI input must not erase an existing physical name. For a
             # new PRJ ID, generate a deterministic unique variant from the acronym.
-            existing_physical = self.repo.physical_name_for_prj(prj_id)
+            existing_physical = self._physical_name_cached(prj_id)
             if existing_physical:
                 physical_name = existing_physical
             else:
@@ -116,10 +197,10 @@ class DataDictionaryService:
                 if not base_physical_name:
                     raise HTTPException(status_code=422, detail="PRJ Physical Attribute Name could not be generated.")
                 try:
-                    physical_name = self.repo.available_physical_name(base_physical_name, exclude_prj_id=prj_id)
+                    physical_name = self._available_physical_cached(base_physical_name, prj_id)
                 except ValueError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
-        elif self.repo.physical_name_exists(physical_name, exclude_prj_id=prj_id):
+        elif self._physical_exists_cached(physical_name, exclude_prj_id=prj_id):
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -128,11 +209,11 @@ class DataDictionaryService:
                 ),
             )
 
-        original_type = self.repo.original_mapping_type(prj_id)
+        original_type = self._original_mapping_type_cached(prj_id)
         mapping_type = mapping_type_from_value(payload.calculated_or_reported, original_type)
         editable = editable_from_mapping_type(payload.calculated_or_reported)
         try:
-            source_abbr_name = self.repo.source_code(payload.source_name, payload.source_abbr_name)
+            source_abbr_name = self._source_code_cached(payload.source_name, payload.source_abbr_name)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         calculation_logic = payload.calculation_logic if payload.calculation_logic is not None else "NA"
@@ -140,14 +221,18 @@ class DataDictionaryService:
         tech_logic = normalize_text(payload.tech_logic) or generate_tech_logic(calculation_logic)
         segment = normalize_text(payload.segment) or "NA"
         display_name = normalize_text(payload.display_name) or normalize_text(payload.prj_attribute_name)
+        section = normalize_pipe_values(payload.section)
+        subsection = normalize_pipe_values(payload.sub_section)
+        if not section or not subsection:
+            raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
 
         raw = {
             "portfolio": portfolio["sector_name"] if portfolio["portfolio_name"] == "FI" else portfolio["portfolio_name"],
             "prj_id": prj_id,
             "prj_attribute_name": normalize_text(payload.prj_attribute_name),
             "prj_physical_attribute_name": physical_name,
-            "section": normalize_text(payload.section),
-            "sub_section": normalize_text(payload.sub_section),
+            "section": section,
+            "sub_section": subsection,
             "data_type": normalize_text(payload.data_type) or None,
             "calculated_or_reported": normalize_text(payload.calculated_or_reported),
             "calculation_logic": str(calculation_logic),
@@ -179,8 +264,8 @@ class DataDictionaryService:
             "tech_logic": tech_logic,
             "display_order": int(payload.display_order),
             "display_name": display_name,
-            "section": normalize_text(payload.section),
-            "subsection": normalize_text(payload.sub_section),
+            "section": section,
+            "subsection": subsection,
             "prompt_description": payload.prompt_description if payload.prompt_description is not None else payload.attribute_description,
             "examples": payload.examples,
             "is_active": bool(payload.is_active),
@@ -192,9 +277,22 @@ class DataDictionaryService:
     ) -> dict[str, Any]:
         raw, master, rule = self._make_rows(payload)
         try:
-            self.repo.upsert_raw(raw, user, source_operation)
-            self.repo.upsert_staging_master(master, user, source_operation)
-            self.repo.upsert_staging_rule(rule, user, source_operation)
+            if hasattr(self.repo, "emit_deferred_insert_audits"):
+                pending_audits: list[dict[str, Any]] = []
+                raw_audit = self.repo.upsert_raw(raw, user, source_operation, defer_insert_audit=True)
+                if raw_audit:
+                    pending_audits.append(raw_audit)
+                self.repo.upsert_staging_master(master, user, source_operation)
+                rule_audit = self.repo.upsert_staging_rule(rule, user, source_operation, defer_insert_audit=True)
+                if rule_audit:
+                    pending_audits.append(rule_audit)
+                self.repo.emit_deferred_insert_audits(pending_audits)
+            else:
+                # Compatibility for lightweight repository substitutes used by
+                # tests/integrations that implement the original interface.
+                self.repo.upsert_raw(raw, user, source_operation)
+                self.repo.upsert_staging_master(master, user, source_operation)
+                self.repo.upsert_staging_rule(rule, user, source_operation)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
@@ -202,6 +300,7 @@ class DataDictionaryService:
             # UI compatibility label for the generated identifier; the persisted key remains PRJ ID.
             "cfv_id": master["prj_id"],
             "staged": True,
+            "final_tables_updated": False,
             "portfolio": payload.portfolio,
             "prj_physical_attribute_name": master["prj_physical_attribute_name"],
             "staged_tables": [
@@ -253,7 +352,107 @@ class DataDictionaryService:
             raise
         return {"staged_count": len(staged), "rows": staged}
 
+    def stage_bulk_pending(
+        self, payloads: list[AttributeUpsert], user: str, source_operation: str
+    ) -> list[dict[str, Any]]:
+        """Stage a workbook in a fixed number of lookup queries.
+
+        This is the high-throughput path used by bulk upload. It preloads all raw
+        and staging objects once, updates them through in-memory caches, and flushes
+        generated identity values once at the end instead of issuing savepoints and
+        lookup queries for every workbook row.
+        """
+        if not payloads:
+            return []
+        self.prepare_bulk_cache(payloads)
+        prepared: list[tuple[AttributeUpsert, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+        for payload in payloads:
+            raw, master, rule = self._make_rows(payload)
+            prepared.append((payload, raw, master, rule))
+
+        caches = self.repo.preload_pending_objects({master["prj_id"] for _, _, master, _ in prepared})
+        pending_audits: list[dict[str, Any]] = []
+        staged: list[dict[str, Any]] = []
+        with self.db.no_autoflush:
+            for payload, raw, master, rule in prepared:
+                raw_audit = self.repo.upsert_raw_cached(raw, user, source_operation, caches["raw"])
+                if raw_audit:
+                    pending_audits.append(raw_audit)
+                self.repo.upsert_staging_master_cached(master, user, source_operation, caches["masters"])
+                rule_audit = self.repo.upsert_staging_rule_cached(rule, user, source_operation, caches["rules"])
+                if rule_audit:
+                    pending_audits.append(rule_audit)
+                staged.append(
+                    {
+                        "prj_id": master["prj_id"],
+                        "cfv_id": master["prj_id"],
+                        "staged": True,
+                        "final_tables_updated": False,
+                        "portfolio": payload.portfolio,
+                        "prj_physical_attribute_name": master["prj_physical_attribute_name"],
+                    }
+                )
+        self.repo.emit_deferred_insert_audits(pending_audits)
+        return staged
+
+    @staticmethod
+    def _readable_value(value: Any) -> str:
+        if value is None:
+            return "—"
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        text = str(value)
+        return text if text.strip() else "—"
+
+    @classmethod
+    def _field_change_rows(
+        cls,
+        prj_id: str,
+        delta_type: str,
+        scope: str,
+        before: dict[str, Any] | None,
+        after: dict[str, Any] | None,
+        fields: list[str],
+    ) -> list[dict[str, Any]]:
+        labels = {
+            "prj_attribute_name": "Attribute Name",
+            "prj_attribute_definition": "Attribute Definition",
+            "prj_physical_attribute_name": "Physical Attribute Name",
+            "where_in_financial_statement": "Segment",
+            "source_abbr_name": "Source",
+            "editable": "Editable",
+            "symbol": "Data Type",
+            "mapping_type": "Calculated / Reported",
+            "calculation_logic": "Calculation Logic",
+            "prj_attribute_description": "Attribute Description",
+            "tech_logic": "Tech Logic",
+            "display_order": "Display Order",
+            "display_name": "Display Name",
+            "section": "Section",
+            "subsection": "Sub-Section",
+            "prompt_description": "Prompt Description",
+            "examples": "Examples",
+            "is_active": "Active",
+            "port_ref_id": "Portfolio Ref ID",
+        }
+        result = []
+        for field in fields:
+            left = None if before is None else before.get(field)
+            right = None if after is None else after.get(field)
+            result.append(
+                {
+                    "prj_id": prj_id,
+                    "change_type": delta_type,
+                    "scope": scope,
+                    "field": labels.get(field, field.replace("_", " ").title()),
+                    "before_value": cls._readable_value(left),
+                    "after_value": cls._readable_value(right),
+                }
+            )
+        return result
+
     def compare_upload(self, payloads: list[AttributeUpsert], include_missing_deleted: bool = False) -> dict[str, Any]:
+        self.prepare_bulk_cache(payloads)
         uploaded: dict[str, dict[str, Any]] = {}
         for payload in payloads:
             _, master, rule = self._make_rows(payload)
@@ -264,18 +463,23 @@ class DataDictionaryService:
             bucket["master"] = master
             bucket["rules"].append(rule)
 
+        final_masters, final_rules_by_prj = self.repo.preload_final_state(set(uploaded))
         delta_rows: list[dict[str, Any]] = []
+        change_rows: list[dict[str, Any]] = []
+        unchanged_count = 0
+
         for prj_id, bucket in uploaded.items():
-            staged_master = bucket["master"]
-            final_master = self.repo.get_master(prj_id, "dbo")
-            master_changes = self._changed_fields(final_master, staged_master, MASTER_COMPARE_FIELDS)
-            final_rules = self.repo.get_rules(prj_id, "dbo")
+            incoming_master = bucket["master"]
+            final_master = final_masters.get(prj_id)
+            master_changes = self._changed_fields(final_master, incoming_master, MASTER_COMPARE_FIELDS)
+            final_rules = final_rules_by_prj.get(prj_id, [])
             rule_changes: list[str] = []
+            local_changes: list[dict[str, Any]] = []
+
             for incoming in bucket["rules"]:
                 exact = next(
                     (
-                        row
-                        for row in final_rules
+                        row for row in final_rules
                         if int(row["port_ref_id"]) == int(incoming["port_ref_id"])
                         and row["source_abbr_name"] == incoming["source_abbr_name"]
                         and int(row["display_order"]) == int(incoming["display_order"])
@@ -288,8 +492,16 @@ class DataDictionaryService:
                 before_rule = exact or (same_port[0] if len(same_port) == 1 else None)
                 fields = self._changed_fields(before_rule, incoming, RULE_COMPARE_FIELDS)
                 if fields:
-                    rule_changes.append(
-                        f"port_ref_id={incoming['port_ref_id']}:" + ",".join(fields)
+                    rule_changes.append(f"port_ref_id={incoming['port_ref_id']}:" + ",".join(fields))
+                    local_changes.extend(
+                        self._field_change_rows(
+                            prj_id,
+                            "NEW" if final_master is None else "UPDATED",
+                            f"Business Rule / port_ref_id={incoming['port_ref_id']}",
+                            before_rule,
+                            incoming,
+                            fields,
+                        )
                     )
 
             if final_master is None:
@@ -297,35 +509,71 @@ class DataDictionaryService:
             elif master_changes or rule_changes:
                 delta_type = "UPDATED"
             else:
+                unchanged_count += 1
                 continue
+
+            change_rows.extend(
+                self._field_change_rows(
+                    prj_id, delta_type, "Attribute Master", final_master, incoming_master, master_changes
+                )
+            )
+            # Ensure rule rows use the final PRJ-level change type.
+            for row in local_changes:
+                row["change_type"] = delta_type
+            change_rows.extend(local_changes)
             delta_rows.append(
                 {
                     "prj_id": prj_id,
                     "attribute_name": bucket["attribute_name"],
                     "delta_type": delta_type,
-                    "changed_fields": master_changes,
-                    "rule_changes": rule_changes,
+                    "changed_field_count": len(master_changes) + sum(1 for row in local_changes),
                 }
             )
 
         if include_missing_deleted:
             uploaded_ids = set(uploaded)
-            final_ids = {row["prj_id"] for row in self.repo.editable_rows(include_deleted=False)}
-            for prj_id in sorted(final_ids - uploaded_ids):
-                final_master = self.repo.get_master(prj_id, "dbo") or {}
+            final_ids = self.repo.active_final_prj_ids()
+            missing_ids = final_ids - uploaded_ids
+            missing_masters, _ = self.repo.preload_final_state(missing_ids)
+            for prj_id in sorted(missing_ids):
+                final_master = missing_masters.get(prj_id) or {}
                 delta_rows.append(
                     {
                         "prj_id": prj_id,
                         "attribute_name": final_master.get("prj_attribute_name"),
                         "delta_type": "DELETED",
-                        "changed_fields": ["is_active"],
-                        "rule_changes": ["all active scopes"],
+                        "changed_field_count": 1,
                     }
+                )
+                change_rows.extend(
+                    self._field_change_rows(
+                        prj_id,
+                        "DELETED",
+                        "Attribute Master",
+                        {"is_active": True},
+                        {"is_active": False},
+                        ["is_active"],
+                    )
                 )
 
         order = {"NEW": 0, "UPDATED": 1, "DELETED": 2}
         delta_rows.sort(key=lambda row: (order.get(row["delta_type"], 9), str(row["prj_id"])))
-        return {"count": len(delta_rows), "rows": delta_rows, "has_changes": bool(delta_rows)}
+        change_rows.sort(
+            key=lambda row: (order.get(row["change_type"], 9), str(row["prj_id"]), row["scope"], row["field"])
+        )
+        summary = {
+            "inserted": sum(1 for row in delta_rows if row["delta_type"] == "NEW"),
+            "updated": sum(1 for row in delta_rows if row["delta_type"] == "UPDATED"),
+            "deleted": sum(1 for row in delta_rows if row["delta_type"] == "DELETED"),
+            "unchanged": unchanged_count,
+        }
+        return {
+            "count": len(delta_rows),
+            "rows": delta_rows,
+            "changes": change_rows,
+            "summary": summary,
+            "has_changes": bool(delta_rows),
+        }
 
     def stage_delete(self, prj_id: str, user: str) -> dict[str, Any]:
         try:
@@ -366,15 +614,23 @@ class DataDictionaryService:
         return changed
 
     def delta(self) -> dict[str, Any]:
+        prj_ids = self.repo.staging_prj_ids()
+        if not prj_ids:
+            return {"count": 0, "rows": [], "has_changes": False}
+
+        id_set = set(prj_ids)
+        staged_masters, staged_rules_by_prj = self.repo.preload_state(id_set, "stg")
+        final_masters, final_rules_by_prj = self.repo.preload_state(id_set, "dbo")
         items: list[dict[str, Any]] = []
-        for prj_id in self.repo.staging_prj_ids():
-            staged_master = self.repo.get_master(prj_id, "stg")
-            final_master = self.repo.get_master(prj_id, "dbo")
+
+        for prj_id in prj_ids:
+            staged_master = staged_masters.get(prj_id)
+            final_master = final_masters.get(prj_id)
             if not staged_master:
                 continue
             changed = self._changed_fields(final_master, staged_master, MASTER_COMPARE_FIELDS)
-            staged_rules = self.repo.get_rules(prj_id, "stg")
-            final_rules = self.repo.get_rules(prj_id, "dbo")
+            staged_rules = staged_rules_by_prj.get(prj_id, [])
+            final_rules = final_rules_by_prj.get(prj_id, [])
             rule_changes: list[str] = []
             for row in staged_rules:
                 exact = next(

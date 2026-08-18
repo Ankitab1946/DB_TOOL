@@ -1,6 +1,7 @@
 """Business logic for raw -> staging -> final data dictionary operations."""
 from __future__ import annotations
 
+import inspect
 from copy import deepcopy
 from datetime import datetime
 from typing import Any
@@ -274,6 +275,23 @@ class DataDictionaryService:
         return raw, master, rule
 
     @staticmethod
+    def _expand_raw_pairs(raw: dict[str, Any]) -> list[dict[str, Any]]:
+        """Expand pipe-separated raw Section/Sub-Section values into positional rows."""
+        try:
+            pairs = pair_pipe_values(raw.get("section"), raw.get("sub_section"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not pairs:
+            raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
+        rows: list[dict[str, Any]] = []
+        for section, subsection in pairs:
+            expanded = dict(raw)
+            expanded["section"] = section
+            expanded["sub_section"] = subsection
+            rows.append(expanded)
+        return rows
+
+    @staticmethod
     def _expand_rule_pairs(rule: dict[str, Any]) -> list[dict[str, Any]]:
         """Expand pipe-separated Section/Sub-Section values into positional rule rows."""
         try:
@@ -294,13 +312,22 @@ class DataDictionaryService:
         self, payload: AttributeUpsert, user: str, source_operation: str = "UI"
     ) -> dict[str, Any]:
         raw, master, rule = self._make_rows(payload)
+        raw_rows = self._expand_raw_pairs(raw)
         rules = self._expand_rule_pairs(rule)
         try:
             if hasattr(self.repo, "emit_deferred_insert_audits"):
                 pending_audits: list[dict[str, Any]] = []
-                raw_audit = self.repo.upsert_raw(raw, user, source_operation, defer_insert_audit=True)
-                if raw_audit:
-                    pending_audits.append(raw_audit)
+                raw_method = self.repo.upsert_raw
+                raw_params = inspect.signature(raw_method).parameters
+                for index, expanded_raw in enumerate(raw_rows):
+                    kwargs: dict[str, Any] = {}
+                    if "defer_insert_audit" in raw_params:
+                        kwargs["defer_insert_audit"] = True
+                    if "strict_key" in raw_params:
+                        kwargs["strict_key"] = index > 0
+                    raw_audit = raw_method(expanded_raw, user, source_operation, **kwargs)
+                    if raw_audit:
+                        pending_audits.append(raw_audit)
                 self.repo.upsert_staging_master(master, user, source_operation)
                 for index, expanded_rule in enumerate(rules):
                     rule_audit = self.repo.upsert_staging_rule(
@@ -316,7 +343,11 @@ class DataDictionaryService:
             else:
                 # Compatibility for lightweight repository substitutes used by
                 # tests/integrations that implement the original interface.
-                self.repo.upsert_raw(raw, user, source_operation)
+                raw_method = self.repo.upsert_raw
+                raw_params = inspect.signature(raw_method).parameters
+                for index, expanded_raw in enumerate(raw_rows):
+                    kwargs = {"strict_key": index > 0} if "strict_key" in raw_params else {}
+                    raw_method(expanded_raw, user, source_operation, **kwargs)
                 self.repo.upsert_staging_master(master, user, source_operation)
                 for expanded_rule in rules:
                     self.repo.upsert_staging_rule(expanded_rule, user, source_operation)
@@ -330,6 +361,7 @@ class DataDictionaryService:
             "final_tables_updated": False,
             "portfolio": payload.portfolio,
             "prj_physical_attribute_name": master["prj_physical_attribute_name"],
+            "raw_rows_staged": len(raw_rows),
             "business_rule_rows_staged": len(rules),
             "staged_tables": [
                 "dbo.raw_prj_attribute_new_test",
@@ -393,19 +425,22 @@ class DataDictionaryService:
         if not payloads:
             return []
         self.prepare_bulk_cache(payloads)
-        prepared: list[tuple[AttributeUpsert, dict[str, Any], dict[str, Any], list[dict[str, Any]]]] = []
+        prepared: list[tuple[AttributeUpsert, list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]] = []
         for payload in payloads:
             raw, master, rule = self._make_rows(payload)
-            prepared.append((payload, raw, master, self._expand_rule_pairs(rule)))
+            prepared.append((payload, self._expand_raw_pairs(raw), master, self._expand_rule_pairs(rule)))
 
         caches = self.repo.preload_pending_objects({master["prj_id"] for _, _, master, _ in prepared})
         pending_audits: list[dict[str, Any]] = []
         staged: list[dict[str, Any]] = []
         with self.db.no_autoflush:
-            for payload, raw, master, rules in prepared:
-                raw_audit = self.repo.upsert_raw_cached(raw, user, source_operation, caches["raw"])
-                if raw_audit:
-                    pending_audits.append(raw_audit)
+            for payload, raw_rows, master, rules in prepared:
+                for index, expanded_raw in enumerate(raw_rows):
+                    raw_audit = self.repo.upsert_raw_cached(
+                        expanded_raw, user, source_operation, caches["raw"], strict_key=index > 0
+                    )
+                    if raw_audit:
+                        pending_audits.append(raw_audit)
                 self.repo.upsert_staging_master_cached(master, user, source_operation, caches["masters"])
                 for index, expanded_rule in enumerate(rules):
                     rule_audit = self.repo.upsert_staging_rule_cached(
@@ -425,6 +460,7 @@ class DataDictionaryService:
                         "final_tables_updated": False,
                         "portfolio": payload.portfolio,
                         "prj_physical_attribute_name": master["prj_physical_attribute_name"],
+                        "raw_rows_staged": len(raw_rows),
                         "business_rule_rows_staged": len(rules),
                     }
                 )

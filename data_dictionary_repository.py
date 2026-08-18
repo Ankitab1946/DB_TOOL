@@ -46,6 +46,39 @@ class DataDictionaryRepository:
     def __init__(self, db: Session):
         self.db = db
 
+    def hard_delete_dictionary_data(self) -> dict[str, int]:
+        """Hard-delete mutable dictionary/history data and restore reference baseline.
+
+        Delete order is foreign-key safe for both SQL Server and PostgreSQL. The
+        four required portfolio seed rows (port_ref_id 1-4) and the external,
+        read-only ``dbo.prj_data_sources`` table are preserved so the application
+        remains usable immediately after cleanup. The caller owns commit/rollback.
+        """
+        deleted: dict[str, int] = {}
+        targets = (
+            ("stg.prj_attribute_business_rules_new_test", StagingBusinessRule),
+            ("dbo.prj_attribute_business_rules_new_test", AttributeBusinessRule),
+            ("stg.prj_attribute_master_new_test", StagingAttributeMaster),
+            ("dbo.prj_attribute_master_new_test", AttributeMaster),
+            ("dbo.raw_prj_attribute_new_test", RawAttribute),
+            ("dbo.audit_table_new_test", AuditTable),
+        )
+        for table_name, model in targets:
+            count = int(self.db.scalar(select(func.count()).select_from(model)) or 0)
+            self.db.execute(delete(model))
+            deleted[table_name] = count
+
+        custom_portfolio_filter = ~PortfolioReference.port_ref_id.in_([1, 2, 3, 4])
+        custom_portfolio_count = int(
+            self.db.scalar(
+                select(func.count()).select_from(PortfolioReference).where(custom_portfolio_filter)
+            )
+            or 0
+        )
+        self.db.execute(delete(PortfolioReference).where(custom_portfolio_filter))
+        deleted["dbo.prj_portfolio_reference_new_test (custom rows)"] = custom_portfolio_count
+        return deleted
+
     def audit(
         self,
         schema_name: str,
@@ -633,6 +666,7 @@ class DataDictionaryRepository:
         user: str,
         source_operation: str,
         cache: dict[tuple[str, str], list[RawAttribute]],
+        strict_key: bool = False,
     ) -> dict[str, Any] | None:
         key = (str(row["prj_id"]), str(row["portfolio"]))
         existing = cache.setdefault(key, [])
@@ -767,6 +801,7 @@ class DataDictionaryRepository:
         user: str,
         source_operation: str,
         defer_insert_audit: bool = False,
+        strict_key: bool = False,
     ) -> dict[str, Any] | None:
         existing = self.active_raw_for_scope(row["prj_id"], row["portfolio"])
         target = next(
@@ -778,9 +813,9 @@ class DataDictionaryRepository:
             ),
             None,
         )
-        if target is None and len(existing) == 1 and not source_operation.upper().startswith("BULK_"):
+        if target is None and len(existing) == 1 and not strict_key and not source_operation.upper().startswith("BULK_"):
             target = existing[0]
-        if target is None and len(existing) > 1 and not source_operation.upper().startswith("BULK_"):
+        if target is None and len(existing) > 1 and not strict_key and not source_operation.upper().startswith("BULK_"):
             raise ValueError(
                 f"Cannot unambiguously update raw row for {row['prj_id']} / {row['portfolio']}; "
                 "multiple raw rows exist and the edited key no longer matches."

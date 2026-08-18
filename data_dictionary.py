@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
@@ -31,8 +31,17 @@ def detail(prj_id: str, db: Session = Depends(get_db)):
 @router.post("/attributes")
 def create_attribute(payload: AttributeUpsert, request: Request, db: Session = Depends(get_db)):
     user = current_user(request)
-    payload.prj_id = None
-    return DataDictionaryService(db).stage_attribute(payload, user, "UI_CREATE")
+    service = DataDictionaryService(db)
+    # The UI pre-generates and displays the CFV/PRJ ID in read-only form. Preserve
+    # that exact identifier on save so the value shown to the user is the value staged.
+    if not payload.prj_id:
+        payload.prj_id = service.next_prj_id()
+    elif payload.prj_id in service.repo.existing_prj_ids():
+        raise HTTPException(
+            status_code=409,
+            detail=f"CFV ID {payload.prj_id} is no longer available. Close and reopen Create New Attribute to generate the next ID.",
+        )
+    return service.stage_attribute(payload, user, "UI_CREATE")
 
 @router.put("/attributes/{prj_id}")
 def edit_attribute(prj_id: str, payload: AttributeUpsert, request: Request, db: Session = Depends(get_db)):

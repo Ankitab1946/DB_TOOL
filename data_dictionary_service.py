@@ -26,6 +26,7 @@ from DataDictionaryAdminApp.utils.normalizers import (
     mapping_type_from_value,
     normalize_pipe_values,
     normalize_text,
+    pair_pipe_values,
 )
 
 
@@ -272,10 +273,28 @@ class DataDictionaryService:
         }
         return raw, master, rule
 
+    @staticmethod
+    def _expand_rule_pairs(rule: dict[str, Any]) -> list[dict[str, Any]]:
+        """Expand pipe-separated Section/Sub-Section values into positional rule rows."""
+        try:
+            pairs = pair_pipe_values(rule.get("section"), rule.get("subsection"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not pairs:
+            raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
+        rows: list[dict[str, Any]] = []
+        for section, subsection in pairs:
+            expanded = dict(rule)
+            expanded["section"] = section
+            expanded["subsection"] = subsection
+            rows.append(expanded)
+        return rows
+
     def stage_attribute_pending(
         self, payload: AttributeUpsert, user: str, source_operation: str = "UI"
     ) -> dict[str, Any]:
         raw, master, rule = self._make_rows(payload)
+        rules = self._expand_rule_pairs(rule)
         try:
             if hasattr(self.repo, "emit_deferred_insert_audits"):
                 pending_audits: list[dict[str, Any]] = []
@@ -283,16 +302,24 @@ class DataDictionaryService:
                 if raw_audit:
                     pending_audits.append(raw_audit)
                 self.repo.upsert_staging_master(master, user, source_operation)
-                rule_audit = self.repo.upsert_staging_rule(rule, user, source_operation, defer_insert_audit=True)
-                if rule_audit:
-                    pending_audits.append(rule_audit)
+                for index, expanded_rule in enumerate(rules):
+                    rule_audit = self.repo.upsert_staging_rule(
+                        expanded_rule,
+                        user,
+                        source_operation,
+                        defer_insert_audit=True,
+                        strict_key=index > 0,
+                    )
+                    if rule_audit:
+                        pending_audits.append(rule_audit)
                 self.repo.emit_deferred_insert_audits(pending_audits)
             else:
                 # Compatibility for lightweight repository substitutes used by
                 # tests/integrations that implement the original interface.
                 self.repo.upsert_raw(raw, user, source_operation)
                 self.repo.upsert_staging_master(master, user, source_operation)
-                self.repo.upsert_staging_rule(rule, user, source_operation)
+                for expanded_rule in rules:
+                    self.repo.upsert_staging_rule(expanded_rule, user, source_operation)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
@@ -303,6 +330,7 @@ class DataDictionaryService:
             "final_tables_updated": False,
             "portfolio": payload.portfolio,
             "prj_physical_attribute_name": master["prj_physical_attribute_name"],
+            "business_rule_rows_staged": len(rules),
             "staged_tables": [
                 "dbo.raw_prj_attribute_new_test",
                 "stg.prj_attribute_master_new_test",
@@ -365,23 +393,30 @@ class DataDictionaryService:
         if not payloads:
             return []
         self.prepare_bulk_cache(payloads)
-        prepared: list[tuple[AttributeUpsert, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+        prepared: list[tuple[AttributeUpsert, dict[str, Any], dict[str, Any], list[dict[str, Any]]]] = []
         for payload in payloads:
             raw, master, rule = self._make_rows(payload)
-            prepared.append((payload, raw, master, rule))
+            prepared.append((payload, raw, master, self._expand_rule_pairs(rule)))
 
         caches = self.repo.preload_pending_objects({master["prj_id"] for _, _, master, _ in prepared})
         pending_audits: list[dict[str, Any]] = []
         staged: list[dict[str, Any]] = []
         with self.db.no_autoflush:
-            for payload, raw, master, rule in prepared:
+            for payload, raw, master, rules in prepared:
                 raw_audit = self.repo.upsert_raw_cached(raw, user, source_operation, caches["raw"])
                 if raw_audit:
                     pending_audits.append(raw_audit)
                 self.repo.upsert_staging_master_cached(master, user, source_operation, caches["masters"])
-                rule_audit = self.repo.upsert_staging_rule_cached(rule, user, source_operation, caches["rules"])
-                if rule_audit:
-                    pending_audits.append(rule_audit)
+                for index, expanded_rule in enumerate(rules):
+                    rule_audit = self.repo.upsert_staging_rule_cached(
+                        expanded_rule,
+                        user,
+                        source_operation,
+                        caches["rules"],
+                        strict_key=index > 0,
+                    )
+                    if rule_audit:
+                        pending_audits.append(rule_audit)
                 staged.append(
                     {
                         "prj_id": master["prj_id"],
@@ -390,6 +425,7 @@ class DataDictionaryService:
                         "final_tables_updated": False,
                         "portfolio": payload.portfolio,
                         "prj_physical_attribute_name": master["prj_physical_attribute_name"],
+                        "business_rule_rows_staged": len(rules),
                     }
                 )
         self.repo.emit_deferred_insert_audits(pending_audits)
@@ -461,7 +497,7 @@ class DataDictionaryService:
                 {"master": master, "rules": [], "attribute_name": master["prj_attribute_name"]},
             )
             bucket["master"] = master
-            bucket["rules"].append(rule)
+            bucket["rules"].extend(self._expand_rule_pairs(rule))
 
         final_masters, final_rules_by_prj = self.repo.preload_final_state(set(uploaded))
         delta_rows: list[dict[str, Any]] = []
@@ -728,7 +764,7 @@ class DataDictionaryService:
             and rule.subsection == staged.get("subsection")
         )
 
-    def _upsert_final_rule(self, staged: dict[str, Any], user: str) -> None:
+    def _upsert_final_rule(self, staged: dict[str, Any], user: str, strict_key: bool = False) -> None:
         candidates = list(
             self.db.scalars(
                 select(AttributeBusinessRule)
@@ -740,8 +776,8 @@ class DataDictionaryService:
             ).all()
         )
         exact = next((row for row in candidates if self._same_rule_key(row, staged)), None)
-        target = exact or (candidates[0] if len(candidates) == 1 else None)
-        if len(candidates) > 1 and exact is None:
+        target = exact or (candidates[0] if len(candidates) == 1 and not strict_key else None)
+        if len(candidates) > 1 and exact is None and not strict_key:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -840,8 +876,13 @@ class DataDictionaryService:
                             "FINALIZE",
                         )
                 else:
-                    for staged_rule in self.repo.get_rules(prj_id, "stg"):
-                        self._upsert_final_rule(staged_rule, user)
+                    staged_rules = self.repo.get_rules(prj_id, "stg")
+                    seen_ports: dict[int, int] = {}
+                    for staged_rule in staged_rules:
+                        port_ref_id = int(staged_rule["port_ref_id"])
+                        occurrence = seen_ports.get(port_ref_id, 0)
+                        self._upsert_final_rule(staged_rule, user, strict_key=occurrence > 0)
+                        seen_ports[port_ref_id] = occurrence + 1
             self.repo.clear_staging(prj_ids)
             self.db.commit()
         except IntegrityError as exc:

@@ -13,7 +13,7 @@ import streamlit as st
 from streamlit_modal import Modal
 
 from DataDictionaryAdminApp.service.excel_service import STANDARD_FIELDS
-from DataDictionaryAdminApp.utils.normalizers import canonical_portfolio_label, generate_physical_name, generate_tech_logic, portfolio_from_sheet_name
+from DataDictionaryAdminApp.utils.normalizers import canonical_portfolio_label, generate_physical_name, generate_tech_logic, pair_pipe_values, portfolio_from_sheet_name
 
 
 def load_env() -> None:
@@ -264,7 +264,7 @@ with st.sidebar:
     if st.session_state.get("database_status_key") != status_key:
         st.session_state["database_status"] = database_status_check()
         st.session_state["database_status_key"] = status_key
-    if st.button("Test Database Connection", use_container_width=True):
+    if st.button("Test Database Connection", width="stretch"):
         st.session_state["database_status"] = database_status_check()
     db_status = st.session_state.get("database_status")
     selected_db_label = db_labels.get(st.session_state["database_type"], st.session_state["database_type"])
@@ -418,7 +418,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         disabled=locked,
         key=f"{prefix}_section",
         placeholder="e.g. Assets|Liabilities",
-        help="Enter one or more Sections. Separate multiple values with | (pipe).",
+        help="Separate multiple values with | (pipe). Section and Sub-Section values are paired positionally (for example Total|Liabilities with Current|Current2 creates Total/Current and Liabilities/Current2).",
     )
     subsection = c2.text_input(
         "Sub-Section *",
@@ -426,7 +426,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         disabled=locked,
         key=f"{prefix}_subsection",
         placeholder="e.g. Current|Non-Current",
-        help="Enter one or more Sub-Sections. Separate multiple values with | (pipe).",
+        help="Separate multiple values with | (pipe). Values are paired positionally with Section values; a single value on one side is reused when the other side contains multiple values.",
     )
     mapping_default = str(rule.get("mapping_type") or "Reported")
     mapping_options = ["Calculated", "Reported", "Repeated"]
@@ -482,6 +482,11 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         return None
     if not attribute_name.strip() or not section.strip() or not subsection.strip():
         st.error("PRJ Attribute Name, Section and Sub-Section are mandatory.")
+        return None
+    try:
+        pair_pipe_values(section, subsection)
+    except ValueError as exc:
+        st.error(str(exc))
         return None
     return {
         "prj_id": str(prj_id),
@@ -555,7 +560,7 @@ with main_tabs[0]:
         }
 
         create_col, deleted_col, _ = st.columns([1.7, 2.0, 5])
-        if create_col.button("Create New Attribute", type="primary", use_container_width=True):
+        if create_col.button("Create New Attribute", type="primary", width="stretch"):
             next_id = api("GET", "/lookups/next-prj-id")
             if next_id and next_id.get("prj_id"):
                 st.session_state["create_next_prj_id"] = next_id
@@ -563,7 +568,7 @@ with main_tabs[0]:
                 create_modal.open()
         if deleted_col.button(
             "Hide Soft Deleted Records" if st.session_state.get("show_soft_deleted") else "View Soft Deleted Records",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state["show_soft_deleted"] = not st.session_state.get("show_soft_deleted", False)
             st.rerun()
@@ -587,7 +592,7 @@ with main_tabs[0]:
                 ]
                 st.dataframe(
                     deleted_frame[[column for column in deleted_columns if column in deleted_frame.columns]],
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     height=300,
                 )
@@ -620,7 +625,7 @@ with main_tabs[0]:
         rows = st.session_state.get("view_rows", [])
 
         b1, b2, b3, b4 = st.columns([1.2, 1.2, 1.2, 4])
-        if b1.button("View Latest", use_container_width=True):
+        if b1.button("View Latest", width="stretch"):
             result = api("POST", "/data-dictionary/filter-page", json=payload)
             if result:
                 st.session_state["view_rows"] = result.get("rows", [])
@@ -628,7 +633,7 @@ with main_tabs[0]:
                 st.session_state["view_filter_signature"] = filter_signature
                 st.session_state["view_loaded"] = True
                 rows = st.session_state["view_rows"]
-        if b2.button("Download Latest", use_container_width=True):
+        if b2.button("Download Latest", width="stretch"):
             response = api("GET", "/data-dictionary/download-latest", binary=True)
             if response:
                 st.session_state["latest_excel"] = response.content
@@ -638,7 +643,7 @@ with main_tabs[0]:
                 st.session_state["latest_excel"],
                 "prj_master_dictionary_latest.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                width="stretch",
             )
         b4.caption(f"{st.session_state.get('view_total', 0)} matching attribute(s)")
         if st.session_state.get("view_filter_signature") and st.session_state.get("view_filter_signature") != filter_signature:
@@ -653,7 +658,7 @@ with main_tabs[0]:
             visible_frame = frame[[c for c in grid_columns if c in frame.columns]].reset_index(drop=True)
             grid_event = st.dataframe(
                 visible_frame,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=430,
                 key="view_latest_grid",
@@ -667,7 +672,7 @@ with main_tabs[0]:
                 st.caption(f"Selected attribute: {selected_prj} - {selected_row.get('prj_attribute_name', '')}")
 
             action1, action2, action3, _ = st.columns([1.2, 1.2, 1.2, 4])
-            if action1.button("Edit", disabled=not selected_prj, use_container_width=True):
+            if action1.button("Edit", disabled=not selected_prj, width="stretch"):
                 detail = api("GET", f"/data-dictionary/attributes/{selected_prj}") if selected_prj else None
                 if detail:
                     st.session_state["selected_prj"] = selected_prj
@@ -675,7 +680,7 @@ with main_tabs[0]:
                     st.session_state["show_edit"] = True
                     st.session_state["edit_unlocked"] = True
                     edit_modal.open()
-            if action2.button("Soft Delete", disabled=not selected_prj, use_container_width=True):
+            if action2.button("Soft Delete", disabled=not selected_prj, width="stretch"):
                 response = api("DELETE", f"/data-dictionary/attributes/{selected_prj}")
                 if response:
                     st.session_state["flash_message"] = (
@@ -684,7 +689,7 @@ with main_tabs[0]:
                     st.session_state["audit_cache_rows"] = None
                     st.session_state["soft_deleted_cache"] = None
                     st.rerun()
-            if action3.button("Reactivate", disabled=not selected_prj, use_container_width=True):
+            if action3.button("Reactivate", disabled=not selected_prj, width="stretch"):
                 response = api("POST", f"/data-dictionary/attributes/{selected_prj}/reactivate")
                 if response:
                     st.session_state["flash_message"] = (
@@ -804,7 +809,7 @@ with main_tabs[0]:
                                 )
                                 if selected_column:
                                     mapping[field] = selected_column
-                            st.dataframe(pd.DataFrame(preview.get("preview", [])), use_container_width=True, hide_index=True, height=220)
+                            st.dataframe(pd.DataFrame(preview.get("preview", [])), width="stretch", hide_index=True, height=220)
                         configs.append({
                             "sheet_name": sheet_name,
                             "header_row": int(header_row),
@@ -891,7 +896,7 @@ with main_tabs[0]:
                     delta_rows = delta.get("rows") or []
                     if delta_rows:
                         st.markdown("##### Changed PRJ IDs")
-                        st.dataframe(pd.DataFrame(delta_rows), use_container_width=True, hide_index=True, height=260)
+                        st.dataframe(pd.DataFrame(delta_rows), width="stretch", hide_index=True, height=260)
                     change_rows = delta.get("changes") or []
                     if change_rows:
                         st.markdown("##### Before / After Changes")
@@ -899,14 +904,14 @@ with main_tabs[0]:
                             pd.DataFrame(change_rows)[
                                 ["prj_id", "change_type", "scope", "field", "before_value", "after_value"]
                             ],
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                             height=420,
                         )
                     rejected_rows = validation.get("rejected") or []
                     if rejected_rows:
                         with st.expander(f"Rejected rows ({len(rejected_rows)})"):
-                            st.dataframe(pd.DataFrame(rejected_rows), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(rejected_rows), width="stretch", hide_index=True)
 
                 stage_result = st.session_state.get("upload_stage_result")
                 if stage_result:
@@ -925,7 +930,7 @@ with main_tabs[0]:
         )
         st.caption(f"Pending delta: {delta.get('count', 0)} attribute(s)")
         if delta.get("rows"):
-            st.dataframe(pd.DataFrame(delta["rows"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(delta["rows"]), width="stretch", hide_index=True)
         else:
             st.info("No staged changes. Finalize is disabled.")
         if is_admin:
@@ -933,10 +938,10 @@ with main_tabs[0]:
         else:
             c1 = st.container()
             c2 = None
-        if c1.button("Finalize and Upload", type="primary", disabled=not delta.get("has_changes"), use_container_width=True):
+        if c1.button("Finalize and Upload", type="primary", disabled=not delta.get("has_changes"), width="stretch"):
             finalize_modal.open()
         if is_admin and c2 is not None:
-            if c2.button("Save Final Tables to S3", use_container_width=True):
+            if c2.button("Save Final Tables to S3", width="stretch"):
                 result = api("POST", "/s3/export-final")
                 if result:
                     st.success(f"Uploaded {len(result.get('files', []))} final-table extract(s) to S3.")
@@ -957,7 +962,7 @@ with main_tabs[1]:
         if search_prompt:
             needle = search_prompt.lower()
             filtered = [row for row in prompts if needle in json.dumps(row, default=str).lower()]
-        st.dataframe(pd.DataFrame(filtered), use_container_width=True, hide_index=True, height=420)
+        st.dataframe(pd.DataFrame(filtered), width="stretch", hide_index=True, height=420)
         scope_ids = [int(row["scope_id"]) for row in filtered]
         selected_scope = st.selectbox("Select scope_id", scope_ids)
         current = next(row for row in filtered if int(row["scope_id"]) == int(selected_scope))
@@ -995,7 +1000,7 @@ with main_tabs[2]:
         st.session_state["audit_cache_signature"] = audit_signature
     audit_rows = st.session_state.get("audit_cache_rows") or []
     if audit_rows:
-        st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True, height=520)
+        st.dataframe(pd.DataFrame(audit_rows), width="stretch", hide_index=True, height=520)
     else:
         st.info("No audit rows found for the selected filters.")
 
@@ -1012,7 +1017,7 @@ if is_admin:
         portfolios_admin = st.session_state.get("admin_portfolios_cache") or []
         st.markdown("#### Portfolio Reference")
         if portfolios_admin:
-            st.dataframe(pd.DataFrame(portfolios_admin), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(portfolios_admin), width="stretch", hide_index=True)
         with st.expander("Add Portfolio"):
             c1, c2 = st.columns(2)
             p_name = c1.text_input("Portfolio Name")
@@ -1104,7 +1109,7 @@ if finalize_modal.is_open():
     with finalize_modal.container():
         st.warning("Do you want to update database tables?")
         c1, c2 = st.columns(2)
-        if c1.button("Yes Upload", type="primary", use_container_width=True):
+        if c1.button("Yes Upload", type="primary", width="stretch"):
             result = api("POST", "/data-dictionary/finalize", json={"confirm": True})
             if result:
                 st.session_state["view_loaded"] = False
@@ -1118,6 +1123,6 @@ if finalize_modal.is_open():
                 st.success(result.get("message", "Finalized successfully."))
                 finalize_modal.close()
                 st.rerun()
-        if c2.button("Cancel", use_container_width=True):
+        if c2.button("Cancel", width="stretch"):
             finalize_modal.close()
             st.rerun()

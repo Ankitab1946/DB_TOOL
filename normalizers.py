@@ -167,27 +167,54 @@ def mapping_type_from_value(value: str | None, original_type: str | None = None)
 
 
 def generate_tech_logic(calculation_logic: str | None) -> str:
-    """Derive compact technical logic from a human-readable calculation formula.
+    """Derive compact PRJ-only technical logic while preserving BODMAS brackets.
 
-    Descriptive labels and parentheses around PRJ references are removed while
-    the PRJ identifiers and arithmetic operators are preserved.  For example::
+    Human-readable labels immediately attached to ``(PRJ...)`` references are
+    removed first.  This prevents slashes that are part of labels, such as
+    ``Debt/Amount(PRJ4343)``, from being mistaken for arithmetic division.
 
-        Total Income(PRJ362) = EBITDA(PRJ43843) - Debt(PRJ4343)
+    Examples::
 
-    becomes::
+        Total Income(PRJ362) = EBITDA(PRJ43843) / Debt(PRJ4343)
+        -> PRJ362 = PRJ43843/PRJ4343
 
-        PRJ362 = PRJ43843-PRJ4343
+        Total Income(PRJ362) = EBITDA(PRJ43843) /Debt/Amount(PRJ4343)
+        -> PRJ362 = PRJ43843/PRJ4343
+
+        Total(PRJ1) = (EBITDA(PRJ2) + Debt(PRJ3)) / Amount(PRJ4)
+        -> PRJ1 = (PRJ2+PRJ3)/PRJ4
     """
     text = normalize_text(calculation_logic)
     if not text or text.upper() == "NA":
         return "NA"
 
-    first = re.search(r"\bPRJ\d+\b", text, flags=re.IGNORECASE)
+    # Replace descriptive labels of the form Label(PRJ123) with PRJ123.  Labels
+    # may contain spaces, ampersands and slashes. Starting at an alphabetic
+    # character ensures a leading arithmetic '/' remains an operator rather than
+    # being swallowed as part of the label.
+    compact = re.sub(
+        r"[A-Za-z][A-Za-z0-9\s&/.,_%'\-]*?\(\s*(PRJ\d+)\s*\)",
+        lambda match: match.group(1).upper(),
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Also normalize bare parenthesized references without descriptive labels.
+    compact = re.sub(
+        r"\(\s*(PRJ\d+)\s*\)",
+        lambda match: match.group(1).upper(),
+        compact,
+        flags=re.IGNORECASE,
+    )
+
+    first = re.search(r"\bPRJ\d+\b", compact, flags=re.IGNORECASE)
     if not first:
         return "NA"
+    expression = compact[first.start():]
 
-    expression = text[first.start():]
-    tokens = re.findall(r"\bPRJ\d+\b|[=+\-*/]", expression, flags=re.IGNORECASE)
+    # Only identifiers, arithmetic operators, equals and grouping parentheses
+    # belong in technical logic. Parentheses left after label replacement are
+    # genuine calculation grouping and are retained for BODMAS precedence.
+    tokens = re.findall(r"\bPRJ\d+\b|[=+\-*/()]", expression, flags=re.IGNORECASE)
     if not tokens:
         return "NA"
 
@@ -197,6 +224,8 @@ def generate_tech_logic(calculation_logic: str | None) -> str:
             rendered += token.upper()
         elif token == "=":
             rendered = rendered.rstrip() + " = "
+        elif token == "(":
+            rendered += "("
         else:
             rendered = rendered.rstrip() + token
     return rendered.strip() or "NA"
@@ -220,6 +249,7 @@ ABBREVIATIONS = {
     "expense": "exp",
     "revenue": "rev",
     "income": "inc",
+    "total": "tot",
 }
 
 
@@ -231,7 +261,7 @@ def generate_physical_name(attribute_name: str) -> str:
     words = re.findall(r"[a-z0-9]+", " ".join(ordered))
     stop = {"and", "the", "of", "for", "to"}
     normalized = [ABBREVIATIONS.get(word, word) for word in words if word not in stop]
-    return " ".join(normalized)[:500]
+    return "_".join(normalized)[:500]
 
 
 def ensure_int(value: object, default: int = 0) -> int:

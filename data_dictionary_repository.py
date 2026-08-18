@@ -389,95 +389,118 @@ class DataDictionaryRepository:
         )
 
     def filter_final(self, filters: Any, page_size: int) -> dict[str, Any]:
-        conditions = []
+        """Filter finalized data at business-rule grain.
+
+        View Latest is intentionally populated from the final business-rules
+        table so one CFV/PRJ ID can appear multiple times when it has multiple
+        Section/Sub-Section/scope records. Master attributes are joined in for
+        their shared descriptive fields.
+        """
         m = AttributeMaster
         r = AttributeBusinessRule
+        p = PortfolioReference
+        conditions: list[Any] = []
+
         if not filters.include_deleted:
-            conditions.append(m.is_active == true())
+            conditions.extend((m.is_active == true(), r.is_active == true()))
         if filters.prj_id:
             conditions.append(m.prj_id.ilike(f"%{filters.prj_id.strip()}%"))
         if filters.attribute_name:
             conditions.append(m.prj_attribute_name.ilike(f"%{filters.attribute_name.strip()}%"))
         if filters.attribute_definition:
             conditions.append(m.prj_attribute_definition.ilike(f"%{filters.attribute_definition.strip()}%"))
-        rule_base = [r.prj_id == m.prj_id]
-        if not filters.include_deleted:
-            rule_base.append(r.is_active == true())
         if filters.section:
-            conditions.append(exists(select(1).where(*rule_base, self._pipe_token_condition(r.section, filters.section))))
+            conditions.append(self._pipe_token_condition(r.section, filters.section))
         if filters.subsection:
-            conditions.append(exists(select(1).where(*rule_base, self._pipe_token_condition(r.subsection, filters.subsection))))
+            conditions.append(self._pipe_token_condition(r.subsection, filters.subsection))
+
         if filters.portfolios:
-            port_ref_ids = []
+            port_ref_ids: list[int] = []
             for portfolio in filters.portfolios:
                 ref = self.portfolio_ref(portfolio)
                 if ref:
                     port_ref_ids.append(int(ref["port_ref_id"]))
             if port_ref_ids:
-                conditions.append(exists(select(1).where(*rule_base, r.port_ref_id.in_(port_ref_ids))))
+                conditions.append(r.port_ref_id.in_(port_ref_ids))
             else:
                 conditions.append(m.prj_id == "__NO_MATCH__")
+
         if filters.sources:
             source_codes = [str(source).strip() for source in filters.sources if str(source).strip()]
             if source_codes:
-                conditions.append(exists(select(1).where(*rule_base, r.source_abbr_name.in_(source_codes))))
+                conditions.append(r.source_abbr_name.in_(source_codes))
+
         if filters.overlapped_only:
-            scope_stmt = select(func.count(distinct(r.port_ref_id))).where(r.prj_id == m.prj_id)
+            scope_stmt = select(func.count(distinct(AttributeBusinessRule.port_ref_id))).where(
+                AttributeBusinessRule.prj_id == m.prj_id
+            )
             if not filters.include_deleted:
-                scope_stmt = scope_stmt.where(r.is_active == true())
-            scope_count = scope_stmt.correlate(m).scalar_subquery()
-            conditions.append(scope_count > 1)
+                scope_stmt = scope_stmt.where(AttributeBusinessRule.is_active == true())
+            conditions.append(scope_stmt.correlate(m).scalar_subquery() > 1)
+
         if filters.search:
             term = f"%{filters.search.strip()}%"
-            conditions.append(or_(m.prj_id.ilike(term), m.prj_attribute_name.ilike(term), m.prj_attribute_definition.ilike(term)))
+            conditions.append(
+                or_(
+                    m.prj_id.ilike(term),
+                    m.prj_attribute_name.ilike(term),
+                    m.prj_attribute_definition.ilike(term),
+                    r.section.ilike(term),
+                    r.subsection.ilike(term),
+                    r.source_abbr_name.ilike(term),
+                    r.display_name.ilike(term),
+                )
+            )
 
-        count_stmt = select(func.count()).select_from(m)
-        data_stmt = select(m)
+        count_stmt = (
+            select(func.count())
+            .select_from(r)
+            .join(m, m.prj_id == r.prj_id)
+            .join(p, p.port_ref_id == r.port_ref_id)
+        )
+        data_stmt = (
+            select(m, r, p)
+            .join(r, r.prj_id == m.prj_id)
+            .join(p, p.port_ref_id == r.port_ref_id)
+        )
         if conditions:
-            count_stmt = count_stmt.where(and_(*conditions))
-            data_stmt = data_stmt.where(and_(*conditions))
+            predicate = and_(*conditions)
+            count_stmt = count_stmt.where(predicate)
+            data_stmt = data_stmt.where(predicate)
+
         total = int(self.db.execute(count_stmt).scalar_one())
         page = max(1, int(filters.page or 1))
-        masters = self.db.scalars(
-            data_stmt.order_by(m.prj_id).offset((page - 1) * page_size).limit(page_size)
+        result_rows = self.db.execute(
+            data_stmt
+            .order_by(m.prj_id, r.display_order, r.scope_id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         ).all()
-        prj_ids = [item.prj_id for item in masters]
-        rules_by_prj: dict[str, list[tuple[AttributeBusinessRule, PortfolioReference]]] = {key: [] for key in prj_ids}
-        if prj_ids:
-            rule_stmt = (
-                select(AttributeBusinessRule, PortfolioReference)
-                .join(PortfolioReference, PortfolioReference.port_ref_id == AttributeBusinessRule.port_ref_id)
-                .where(AttributeBusinessRule.prj_id.in_(prj_ids))
-                .order_by(AttributeBusinessRule.prj_id, AttributeBusinessRule.port_ref_id, AttributeBusinessRule.display_order)
-            )
-            for rule, portfolio in self.db.execute(rule_stmt).all():
-                rules_by_prj.setdefault(rule.prj_id, []).append((rule, portfolio))
 
-        rows = []
-        for master in masters:
+        rows: list[dict[str, Any]] = []
+        for master, rule, portfolio in result_rows:
             item = model_dict(master)
-            pairs = rules_by_prj.get(master.prj_id, [])
-            active_pairs = [pair for pair in pairs if pair[0].is_active]
-            first = (active_pairs or pairs or [(None, None)])[0]
-            rule, _ = first
-            if rule is not None:
-                item.update(
-                    {
-                        "editable": rule.editable,
-                        "symbol": rule.symbol,
-                        "mapping_type": rule.mapping_type,
-                        "calculation_logic": rule.calculation_logic,
-                        "prj_attribute_description": rule.prj_attribute_description,
-                        "tech_logic": rule.tech_logic,
-                        "display_order": rule.display_order,
-                        "display_name": rule.display_name,
-                        "section": rule.section,
-                        "subsection": rule.subsection,
-                    }
-                )
-            scope_pairs = active_pairs if active_pairs else pairs
-            item["portfolios"] = ", ".join(dict.fromkeys(portfolio_label(p.portfolio_name, p.sector_name) for _, p in scope_pairs))
-            item["sources"] = ", ".join(dict.fromkeys(str(rule.source_abbr_name) for rule, _ in scope_pairs))
+            item.update(
+                {
+                    "scope_id": rule.scope_id,
+                    "port_ref_id": rule.port_ref_id,
+                    "portfolio": portfolio_label(portfolio.portfolio_name, portfolio.sector_name),
+                    "portfolios": portfolio_label(portfolio.portfolio_name, portfolio.sector_name),
+                    "source_abbr_name": rule.source_abbr_name,
+                    "sources": str(rule.source_abbr_name),
+                    "editable": rule.editable,
+                    "symbol": rule.symbol,
+                    "mapping_type": rule.mapping_type,
+                    "calculation_logic": rule.calculation_logic,
+                    "prj_attribute_description": rule.prj_attribute_description,
+                    "tech_logic": rule.tech_logic,
+                    "display_order": rule.display_order,
+                    "display_name": rule.display_name,
+                    "section": rule.section,
+                    "subsection": rule.subsection,
+                    "rule_is_active": bool(rule.is_active),
+                }
+            )
             rows.append(item)
         return {"rows": rows, "total": total, "page": page, "page_size": page_size}
 

@@ -115,9 +115,15 @@ def api(method: str, path: str, *, quiet: bool = False, binary: bool = False, **
     return response if binary else response.json()
 
 
+def request_filter_submit() -> None:
+    """Request an immediate View Latest refresh when any filter is committed."""
+    st.session_state["filter_submit_requested"] = True
+
+
 def request_prj_filter_submit() -> None:
-    """Request an immediate View Latest refresh when PRJ_ID is committed with Enter."""
+    """Backward-compatible PRJ_ID callback; delegates to the shared filter refresh."""
     st.session_state["prj_filter_submit_requested"] = True
+    request_filter_submit()
 
 
 def database_status_check() -> dict[str, Any]:
@@ -170,6 +176,7 @@ for key, default in {
     "view_total": 0,
     "view_loaded": False,
     "view_filter_signature": "",
+    "filter_submit_requested": False,
     "prj_filter_submit_requested": False,
     "selected_prj": "",
     "edit_detail": None,
@@ -649,25 +656,85 @@ with main_tabs[0]:
     with view_edit_tab:
         st.subheader("View Latest")
         f1, f2, f3, f4 = st.columns(4)
-        portfolios = f1.multiselect("Portfolio", portfolio_labels)
-        sources = f2.multiselect("Source", source_options, format_func=source_label)
+        portfolios = f1.multiselect(
+            "Portfolio",
+            portfolio_labels,
+            key="view_portfolio_filter",
+            on_change=request_filter_submit,
+            help="Select one or more portfolios; the grid refreshes immediately when the selection is committed.",
+        )
+        sources = f2.multiselect(
+            "Source",
+            source_options,
+            format_func=source_label,
+            key="view_source_filter",
+            on_change=request_filter_submit,
+            help="Select one or more sources; the grid refreshes immediately when the selection is committed.",
+        )
         prj_filter = f3.text_input(
             "PRJ_ID",
             key="view_prj_id_filter",
             on_change=request_prj_filter_submit,
             help="Enter a PRJ_ID and press Enter to refresh View Latest immediately.",
         )
-        name_filter = f4.text_input("Attribute Name")
+        name_filter = f4.text_input(
+            "Attribute Name",
+            key="view_attribute_name_filter",
+            on_change=request_filter_submit,
+            help="Enter an Attribute Name and press Enter to refresh the grid.",
+        )
         f1, f2, f3, f4 = st.columns(4)
-        definition_filter = f1.text_input("Attribute Definition")
-        section_filter = f2.selectbox("Section", [""] + list(lookups.get("sections", [])))
-        subsection_filter = f3.selectbox("Sub-Section", [""] + list(lookups.get("subsections", [])))
-        overlapped = f4.checkbox("Overlapped Attribute only")
+        definition_filter = f1.text_input(
+            "Attribute Definition",
+            key="view_attribute_definition_filter",
+            on_change=request_filter_submit,
+            help="Enter an Attribute Definition and press Enter to refresh the grid.",
+        )
+        section_filter = f2.selectbox(
+            "Section",
+            [""] + list(lookups.get("sections", [])),
+            key="view_section_filter",
+            on_change=request_filter_submit,
+        )
+        subsection_filter = f3.selectbox(
+            "Sub-Section",
+            [""] + list(lookups.get("subsections", [])),
+            key="view_subsection_filter",
+            on_change=request_filter_submit,
+        )
+        overlapped = f4.checkbox(
+            "Overlapped Attribute only",
+            key="view_overlapped_filter",
+            on_change=request_filter_submit,
+        )
         c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
-        include_deleted = c1.checkbox("Include inactive", value=False)
-        page_size = c2.selectbox("Rows", [50, 100, 250, 500], index=1)
-        page_number = c3.number_input("Page", min_value=1, value=1, step=1)
-        search = c4.text_input("Search")
+        include_deleted = c1.checkbox(
+            "Include inactive",
+            value=False,
+            key="view_include_inactive_filter",
+            on_change=request_filter_submit,
+        )
+        page_size = c2.selectbox(
+            "Rows",
+            [50, 100, 250, 500],
+            index=1,
+            key="view_page_size_filter",
+            on_change=request_filter_submit,
+        )
+        page_number = c3.number_input(
+            "Page",
+            min_value=1,
+            value=1,
+            step=1,
+            key="view_page_number_filter",
+            on_change=request_filter_submit,
+        )
+        search = c4.text_input(
+            "Search",
+            key="view_search_filter",
+            on_change=request_filter_submit,
+            help="Enter search text and press Enter to refresh the grid.",
+        )
 
         payload = {
             "portfolios": portfolios,
@@ -761,12 +828,18 @@ with main_tabs[0]:
 
         filter_signature = json.dumps(payload, sort_keys=True, default=str)
 
-        # PRJ_ID is the fast exact-search path. Committing the text input with
-        # Enter triggers its on_change callback and refreshes the grid immediately,
-        # without requiring a second click on View Latest.
+        # Every View Latest filter shares the same refresh path. Text inputs
+        # (PRJ_ID, Attribute Name/Definition, Search) submit when Enter is pressed;
+        # selection widgets refresh as soon as their selection is committed.
         if st.session_state.get("prj_filter_submit_requested"):
-            result = api("POST", "/data-dictionary/filter-page", json=payload)
+            # Preserve the original PRJ_ID Enter-submit contract while routing
+            # the actual refresh through the shared all-filter path.
+            st.session_state["filter_submit_requested"] = True
             st.session_state["prj_filter_submit_requested"] = False
+
+        if st.session_state.get("filter_submit_requested"):
+            result = api("POST", "/data-dictionary/filter-page", json=payload)
+            st.session_state["filter_submit_requested"] = False
             if result:
                 st.session_state["view_rows"] = result.get("rows", [])
                 st.session_state["view_total"] = result.get("total", 0)
@@ -805,7 +878,10 @@ with main_tabs[0]:
             )
         b4.caption(f"{st.session_state.get('view_total', 0)} matching attribute(s)")
         if st.session_state.get("view_filter_signature") and st.session_state.get("view_filter_signature") != filter_signature:
-            st.caption("Filters changed. Click **View Latest** to refresh the grid.")
+            st.caption(
+                "Filters changed. Press **Enter** in a text filter or commit the selection to refresh; "
+                "**View Latest** remains available as a manual refresh."
+            )
 
         if rows:
             grid_columns = [

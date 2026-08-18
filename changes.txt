@@ -1,13 +1,9 @@
 src/DataDictionaryAdminApp/streamlit_app.py
 
-src/DataDictionaryAdminApp/api/schemas_api.py
+src/DataDictionaryAdminApp/api/routers/data_dictionary.py
 
 src/DataDictionaryAdminApp/api/routers/master_upload.py
 
 src/DataDictionaryAdminApp/repositories/data_dictionary_repository.py
 
 src/DataDictionaryAdminApp/service/data_dictionary_service.py
-
-src/DataDictionaryAdminApp/utils/normalizers.py
-
-tests/test_performance_and_pipe_sections.py

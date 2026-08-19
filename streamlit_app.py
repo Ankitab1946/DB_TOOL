@@ -13,7 +13,7 @@ import streamlit as st
 from streamlit_modal import Modal
 
 from DataDictionaryAdminApp.service.excel_service import STANDARD_FIELDS
-from DataDictionaryAdminApp.utils.normalizers import canonical_portfolio_label, generate_physical_name, generate_tech_logic, pair_pipe_values, portfolio_from_sheet_name
+from DataDictionaryAdminApp.utils.normalizers import align_int_pipe_values, align_pipe_values, canonical_portfolio_label, generate_physical_name, generate_tech_logic, pair_pipe_values, portfolio_from_sheet_name
 
 
 class StateAwareModal(Modal):
@@ -143,9 +143,29 @@ VIEW_FILTER_WIDGET_KEYS = (
 
 
 def clear_view_filters() -> None:
-    """Clear every View Latest filter in one action and refresh the grid."""
-    for key in VIEW_FILTER_WIDGET_KEYS:
-        st.session_state.pop(key, None)
+    """Reset both visible filter widgets and the active View Latest query.
+
+    Assign explicit defaults instead of only deleting widget keys.  This keeps
+    Streamlit's frontend widget state and ``st.session_state`` synchronized on
+    the same rerun, so a value such as Section=Asset visibly becomes blank as
+    soon as Clear Filters is clicked.
+    """
+    defaults = {
+        "view_portfolio_filter": [],
+        "view_source_filter": [],
+        "view_prj_id_filter": "",
+        "view_attribute_name_filter": "",
+        "view_attribute_definition_filter": "",
+        "view_section_filter": "",
+        "view_subsection_filter": "",
+        "view_overlapped_filter": False,
+        "view_include_inactive_filter": False,
+        "view_page_size_filter": 100,
+        "view_page_number_filter": 1,
+        "view_search_filter": "",
+    }
+    for key, value in defaults.items():
+        st.session_state[key] = value
     st.session_state["view_rows"] = []
     st.session_state["view_total"] = 0
     st.session_state["view_filter_signature"] = ""
@@ -395,7 +415,12 @@ def render_attribute_modal_style(modal_key: str) -> None:
     st.markdown(
         f"""
 <style>
-div[data-modal-container='true'][key='{modal_key}'] {{
+/* streamlit-modal positions its card independently of the overlay.  Center
+   the actual card explicitly against the browser viewport; centering only the
+   overlay is not sufficient because the library applies its own top/left and
+   transform rules to the first child. */
+div[data-modal-container='true'][key='{modal_key}'],
+div[data-modal-container='true'] {{
     position: fixed !important;
     inset: 0 !important;
     width: 100vw !important;
@@ -405,19 +430,30 @@ div[data-modal-container='true'][key='{modal_key}'] {{
     place-items: center !important;
     overflow: hidden !important;
 }}
-div[data-modal-container='true'][key='{modal_key}'] > div:first-child {{
+div[data-modal-container='true'][key='{modal_key}'] > div:first-child,
+div[data-modal-container='true'] > div:first-child {{
+    position: absolute !important;
+    top: 50% !important;
+    left: 50% !important;
+    right: auto !important;
+    bottom: auto !important;
+    transform: translate(-50%, -50%) !important;
     width: 96vw !important;
     max-width: 1900px !important;
+    max-height: 90vh !important;
     margin: 0 !important;
     align-self: center !important;
     justify-self: center !important;
 }}
-div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child {{
+div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child,
+div[data-modal-container='true'] > div:first-child > div:first-child {{
     margin-top: 0 !important;
     margin-bottom: 0 !important;
-}}
-div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child > div:first-child {{
     max-height: 90vh !important;
+}}
+div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child > div:first-child,
+div[data-modal-container='true'] > div:first-child > div:first-child > div:first-child {{
+    max-height: 88vh !important;
     overflow-y: auto !important;
     overflow-x: hidden !important;
 }}
@@ -550,73 +586,239 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     mapping_options = ["Calculated", "Reported", "Repeated"]
     mapping_index = mapping_options.index(mapping_default) if mapping_default in mapping_options else 1
     calculated = st.selectbox("Calculated or Reported *", mapping_options, index=mapping_index, disabled=locked, key=f"{prefix}_mapping")
-    segment = st.text_input("Segment", value=str(detail.get("where_in_financial_statement") or "NA"), disabled=locked, key=f"{prefix}_segment")
+    segment = st.text_input(
+        "Segment",
+        value=str(rule.get("segment") or detail.get("where_in_financial_statement") or "NA"),
+        disabled=locked,
+        key=f"{prefix}_segment",
+        placeholder="e.g. Balance Sheet|Income Statement",
+        help=(
+            "Segment supports positional pipe-separated values exactly like Section/Sub-Section. "
+            "For Total|Liabilities and Current|Current2, SegmentA|SegmentB maps SegmentA to Total/Current "
+            "and SegmentB to Liabilities/Current2. A single Segment is reused for every pair."
+        ),
+    )
+
+    try:
+        form_pairs = pair_pipe_values(section, subsection)
+    except ValueError:
+        form_pairs = []
+    pair_count = len(form_pairs)
 
     with st.expander("Calculation and Attribute Details", expanded=False):
-        logic_left, logic_right = st.columns(2)
-        calculation_logic = logic_left.text_area(
-            "Calculation Logic",
-            value=str(rule.get("calculation_logic") or "NA"),
-            disabled=locked,
-            height=145,
-            key=f"{prefix}_calc",
-            help="Tech Logic is regenerated whenever Calculation Logic changes.",
-        )
-        attribute_definition = logic_right.text_area(
-            "Attribute Definition",
-            value=str(detail.get("prj_attribute_definition") or ""),
-            disabled=locked,
-            height=145,
-            key=f"{prefix}_definition",
-        )
-        detail_left, detail_right = st.columns(2)
-        attribute_description = detail_left.text_area(
-            "Attribute Description",
-            value=str(rule.get("prj_attribute_description") or ""),
-            disabled=locked,
-            height=145,
-            key=f"{prefix}_description",
-        )
+        definition_source = rule.get("prj_attribute_definition") or detail.get("prj_attribute_definition") or ""
+        description_source = rule.get("prj_attribute_description") or ""
+        calculation_source = rule.get("calculation_logic") or "NA"
+        report_type_source = rule.get("report_type") or "NA"
+        tech_source = rule.get("tech_logic") or ""
+        examples_source = rule.get("examples") or ""
+        display_order_source = rule.get("display_order") if rule.get("display_order") is not None else 0
+        display_name_source = rule.get("display_name") or detail.get("prj_attribute_name") or attribute_name
 
-        # Keep Tech Logic synchronized with Calculation Logic without overwriting
-        # a user's manual Tech Logic edit on unrelated Streamlit reruns.  A new
-        # attribute/scope context is seeded from its stored Tech Logic; changing
-        # Calculation Logic regenerates the compact PRJ-only expression.
-        tech_key = f"{prefix}_tech"
-        tech_context_key = f"{prefix}_tech_context"
-        tech_calc_key = f"{prefix}_tech_source_calc"
-        tech_context = f"{prj_id}:{rule_index}"
-        stored_tech = str(rule.get("tech_logic") or "").strip()
-        if st.session_state.get(tech_context_key) != tech_context:
-            st.session_state[tech_key] = stored_tech or generate_tech_logic(calculation_logic)
-            st.session_state[tech_context_key] = tech_context
-            st.session_state[tech_calc_key] = calculation_logic
-        elif st.session_state.get(tech_calc_key) != calculation_logic:
-            st.session_state[tech_key] = generate_tech_logic(calculation_logic)
-            st.session_state[tech_calc_key] = calculation_logic
+        if pair_count > 1:
+            st.caption(
+                "Attribute Definition and Attribute Description are captured per Section/Sub-Section pair. Scope-specific fields include Calculation Logic, "
+                "Attribute Description, Display Order, Report Type, Tech Logic, Examples and Display Name are staged/finalized "
+                "as separate business-rule values for each pair."
+            )
 
-        tech_logic = detail_right.text_area(
-            "Tech Logic",
-            disabled=locked,
-            height=145,
-            key=tech_key,
-            help=(
-                "Auto-populated from Calculation Logic and preserves calculation brackets. "
-                "Examples: EBITDA(PRJ43843) / Debt(PRJ4343) and EBITDA(PRJ43843) /Debt/Amount(PRJ4343) "
-                "both retain the intended division operator between PRJ references. You can adjust it before saving."
-            ),
-        )
-        examples = st.text_area(
-            "Examples (Prompt Management)",
-            value=str(rule.get("examples") or ""),
-            disabled=locked,
-            height=80,
-            key=f"{prefix}_examples",
-        )
+            def _aligned(source: object, field: str, default: str | None = None) -> list[str | None]:
+                try:
+                    return align_pipe_values(source, pair_count, field, default=default)
+                except ValueError:
+                    return [str(source) if index == 0 and source is not None else default for index in range(pair_count)]
 
-    c1, c2 = st.columns(2)
-    display_order = c1.number_input("Display Order *", min_value=0, value=int(rule.get("display_order") or 0), step=1, disabled=locked, key=f"{prefix}_order")
-    display_name = c2.text_input("Display Name", value=str(rule.get("display_name") or detail.get("prj_attribute_name") or ""), disabled=locked, key=f"{prefix}_display")
+            definition_defaults = _aligned(definition_source, "Attribute Definition")
+            description_defaults = _aligned(description_source, "Attribute Description")
+            calculation_defaults = _aligned(calculation_source, "Calculation Logic", "NA")
+            report_type_defaults = _aligned(report_type_source, "Report Type", "NA")
+            tech_defaults = _aligned(tech_source, "Tech Logic")
+            examples_defaults = _aligned(examples_source, "Examples")
+            display_name_defaults = _aligned(display_name_source, "Display Name", attribute_name)
+            try:
+                display_order_defaults = align_int_pipe_values(display_order_source, pair_count, "Display Order", default=0)
+            except ValueError:
+                display_order_defaults = [int(rule.get("display_order") or 0) for _ in range(pair_count)]
+
+            definition_entries: list[str] = []
+            description_entries: list[str] = []
+            calculation_entries: list[str] = []
+            report_type_entries: list[str] = []
+            tech_entries: list[str] = []
+            examples_entries: list[str] = []
+            display_order_entries: list[int] = []
+            display_name_entries: list[str] = []
+
+            for pair_index, (pair_section, pair_subsection) in enumerate(form_pairs):
+                st.markdown(f"**{pair_section} / {pair_subsection}**")
+                calc_col, report_col, order_col = st.columns([2.4, 1.1, 0.8])
+                pair_calc = calc_col.text_area(
+                    "Calculation Logic",
+                    value=str(calculation_defaults[pair_index] or "NA"),
+                    disabled=locked,
+                    height=105,
+                    key=f"{prefix}_calc_{pair_index}",
+                    help=f"Calculation Logic for {pair_section} / {pair_subsection}.",
+                )
+                calculation_entries.append(pair_calc)
+                report_type_entries.append(
+                    report_col.text_input(
+                        "Report Type",
+                        value=str(report_type_defaults[pair_index] or "NA"),
+                        disabled=locked,
+                        key=f"{prefix}_report_type_{pair_index}",
+                        help=f"Report Type for {pair_section} / {pair_subsection}.",
+                    )
+                )
+                display_order_entries.append(
+                    int(order_col.number_input(
+                        "Display Order *",
+                        min_value=0,
+                        value=int(display_order_defaults[pair_index]),
+                        step=1,
+                        disabled=locked,
+                        key=f"{prefix}_order_{pair_index}",
+                    ))
+                )
+
+                detail_left, detail_right = st.columns(2)
+                definition_entries.append(
+                    detail_left.text_area(
+                        "Attribute Definition",
+                        value=str(definition_defaults[pair_index] or ""),
+                        disabled=locked,
+                        height=100,
+                        key=f"{prefix}_definition_{pair_index}",
+                    )
+                )
+                description_entries.append(
+                    detail_right.text_area(
+                        "Attribute Description",
+                        value=str(description_defaults[pair_index] or ""),
+                        disabled=locked,
+                        height=100,
+                        key=f"{prefix}_description_{pair_index}",
+                    )
+                )
+
+                tech_key = f"{prefix}_tech_{pair_index}"
+                tech_context_key = f"{prefix}_tech_context_{pair_index}"
+                tech_calc_key = f"{prefix}_tech_source_calc_{pair_index}"
+                tech_context = f"{prj_id}:{rule_index}:{pair_index}"
+                stored_tech = str(tech_defaults[pair_index] or "").strip()
+                if st.session_state.get(tech_context_key) != tech_context:
+                    st.session_state[tech_key] = stored_tech or generate_tech_logic(pair_calc)
+                    st.session_state[tech_context_key] = tech_context
+                    st.session_state[tech_calc_key] = pair_calc
+                elif st.session_state.get(tech_calc_key) != pair_calc:
+                    st.session_state[tech_key] = generate_tech_logic(pair_calc)
+                    st.session_state[tech_calc_key] = pair_calc
+
+                tech_left, tech_right = st.columns(2)
+                tech_entries.append(
+                    tech_left.text_area(
+                        "Tech Logic",
+                        disabled=locked,
+                        height=100,
+                        key=tech_key,
+                        help="Auto-generated from this scope's Calculation Logic; can be adjusted before saving.",
+                    )
+                )
+                examples_entries.append(
+                    tech_right.text_area(
+                        "Examples (Prompt Management)",
+                        value=str(examples_defaults[pair_index] or ""),
+                        disabled=locked,
+                        height=100,
+                        key=f"{prefix}_examples_{pair_index}",
+                    )
+                )
+                display_name_entries.append(
+                    st.text_input(
+                        "Display Name",
+                        value=str(display_name_defaults[pair_index] or attribute_name),
+                        disabled=locked,
+                        key=f"{prefix}_display_{pair_index}",
+                    )
+                )
+                st.divider()
+
+            calculation_logic = "|".join(calculation_entries)
+            report_type = "|".join(report_type_entries)
+            attribute_definition = "|".join(definition_entries)
+            attribute_description = "|".join(description_entries)
+            tech_logic = "|".join(tech_entries)
+            examples = "|".join(examples_entries)
+            display_order = "|".join(str(value) for value in display_order_entries)
+            display_name = "|".join(display_name_entries)
+        else:
+            calculation_logic = st.text_area(
+                "Calculation Logic",
+                value=str(calculation_source),
+                disabled=locked,
+                height=125,
+                key=f"{prefix}_calc",
+                help="Tech Logic is regenerated whenever Calculation Logic changes.",
+            )
+            report_type = st.text_input(
+                "Report Type",
+                value=str(report_type_source),
+                disabled=locked,
+                key=f"{prefix}_report_type",
+                help="Report Type is part of the unique Scope key.",
+            )
+            detail_left, detail_right = st.columns(2)
+            attribute_definition = detail_left.text_area(
+                "Attribute Definition",
+                value=str(definition_source),
+                disabled=locked,
+                height=125,
+                key=f"{prefix}_definition",
+            )
+            attribute_description = detail_right.text_area(
+                "Attribute Description",
+                value=str(description_source),
+                disabled=locked,
+                height=125,
+                key=f"{prefix}_description",
+            )
+
+            tech_key = f"{prefix}_tech"
+            tech_context_key = f"{prefix}_tech_context"
+            tech_calc_key = f"{prefix}_tech_source_calc"
+            tech_context = f"{prj_id}:{rule_index}"
+            stored_tech = str(tech_source or "").strip()
+            if st.session_state.get(tech_context_key) != tech_context:
+                st.session_state[tech_key] = stored_tech or generate_tech_logic(calculation_logic)
+                st.session_state[tech_context_key] = tech_context
+                st.session_state[tech_calc_key] = calculation_logic
+            elif st.session_state.get(tech_calc_key) != calculation_logic:
+                st.session_state[tech_key] = generate_tech_logic(calculation_logic)
+                st.session_state[tech_calc_key] = calculation_logic
+
+            tech_left, tech_right = st.columns(2)
+            tech_logic = tech_left.text_area(
+                "Tech Logic",
+                disabled=locked,
+                height=125,
+                key=tech_key,
+                help="Auto-populated from Calculation Logic and editable before saving.",
+            )
+            examples = tech_right.text_area(
+                "Examples (Prompt Management)",
+                value=str(examples_source),
+                disabled=locked,
+                height=100,
+                key=f"{prefix}_examples",
+            )
+            c1, c2 = st.columns(2)
+            display_order = int(c1.number_input(
+                "Display Order *", min_value=0, value=int(display_order_source or 0), step=1,
+                disabled=locked, key=f"{prefix}_order"
+            ))
+            display_name = c2.text_input(
+                "Display Name", value=str(display_name_source), disabled=locked, key=f"{prefix}_display"
+            )
 
     if locked:
         return None
@@ -635,7 +837,16 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         st.error("PRJ Attribute Name, Section and Sub-Section are mandatory.")
         return None
     try:
-        pair_pipe_values(section, subsection)
+        validated_pairs = pair_pipe_values(section, subsection)
+        align_pipe_values(segment, len(validated_pairs), "Segment", default="NA")
+        align_pipe_values(attribute_definition, len(validated_pairs), "Attribute Definition", default=None)
+        align_pipe_values(attribute_description, len(validated_pairs), "Attribute Description", default=None)
+        align_pipe_values(calculation_logic, len(validated_pairs), "Calculation Logic", default="NA")
+        align_pipe_values(report_type, len(validated_pairs), "Report Type", default="NA")
+        align_int_pipe_values(display_order, len(validated_pairs), "Display Order", default=0)
+        align_pipe_values(tech_logic, len(validated_pairs), "Tech Logic", default=None)
+        align_pipe_values(examples, len(validated_pairs), "Examples", default=None)
+        align_pipe_values(display_name, len(validated_pairs), "Display Name", default=attribute_name)
     except ValueError as exc:
         st.error(str(exc))
         return None
@@ -652,10 +863,11 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
         "calculated_or_reported": calculated,
         "calculation_logic": calculation_logic or "NA",
         "segment": segment or "NA",
+        "report_type": report_type or "NA",
         "attribute_definition": attribute_definition or None,
         "attribute_description": attribute_description or None,
         "tech_logic": tech_logic or None,
-        "display_order": int(display_order),
+        "display_order": display_order,
         "display_name": display_name or attribute_name,
         "examples": examples or None,
         "is_active": True,
@@ -816,7 +1028,7 @@ with main_tabs[0]:
                 deleted_columns = [
                     "prj_id", "prj_attribute_name", "prj_attribute_definition",
                     "prj_physical_attribute_name", "portfolios", "sources",
-                    "section", "subsection", "is_active",
+                    "section", "subsection", "report_type", "is_active",
                 ]
                 deleted_visible_frame = deleted_frame[
                     [column for column in deleted_columns if column in deleted_frame.columns]
@@ -922,8 +1134,8 @@ with main_tabs[0]:
         if rows:
             grid_columns = [
                 "scope_id", "prj_id", "prj_attribute_name", "prj_attribute_definition",
-                "prj_physical_attribute_name", "editable", "symbol", "portfolios", "sources",
-                "section", "subsection", "display_order", "is_active",
+                "prj_attribute_description", "prj_physical_attribute_name", "editable", "symbol", "portfolios", "sources",
+                "section", "subsection", "segment", "report_type", "display_order", "is_active",
             ]
             frame = pd.DataFrame(rows)
             visible_frame = frame[[c for c in grid_columns if c in frame.columns]].reset_index(drop=True)

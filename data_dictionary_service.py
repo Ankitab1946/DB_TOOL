@@ -20,6 +20,8 @@ from DataDictionaryAdminApp.model.entities import (
 )
 from DataDictionaryAdminApp.repositories.data_dictionary_repository import DataDictionaryRepository, model_dict, portfolio_label
 from DataDictionaryAdminApp.utils.normalizers import (
+    align_int_pipe_values,
+    align_pipe_values,
     canonical_portfolio_label,
     editable_from_mapping_type,
     generate_physical_name,
@@ -45,7 +47,10 @@ RULE_COMPARE_FIELDS = (
     "symbol",
     "mapping_type",
     "calculation_logic",
+    "prj_attribute_definition",
     "prj_attribute_description",
+    "segment",
+    "report_type",
     "tech_logic",
     "display_order",
     "display_name",
@@ -83,7 +88,72 @@ class DataDictionaryService:
             self._source_code_cache = {str(row.get("source_code") or "").casefold() for row in sources if row.get("source_code")}
         prj_ids = {str(item.prj_id) for item in payloads if item.prj_id}
         self._original_type_cache = self.repo.preload_original_mapping_types(prj_ids)
-        self._physical_owner_cache, self._physical_by_prj_cache = self.repo.preload_physical_names()
+        owners, by_prj = self.repo.preload_physical_names()
+        # Bulk caches must use case-insensitive CFV/PRJ identity semantics. SQL Server
+        # installations are commonly case-insensitive, and PostgreSQL should behave
+        # consistently for application identifiers as well.
+        self._physical_owner_cache = {str(name).casefold(): str(owner) for name, owner in owners.items()}
+        self._physical_by_prj_cache = {str(prj_id).casefold(): str(name) for prj_id, name in by_prj.items()}
+
+    def validate_bulk_physical_name_uniqueness(self, payloads: list[AttributeUpsert]) -> None:
+        """Reject explicitly supplied physical names shared by different CFV/PRJ IDs.
+
+        Multiple workbook rows for the same CFV are valid because one attribute may
+        have several scope rows.  The comparison is case-insensitive for both the
+        physical name and CFV/PRJ ID so SQL Server and PostgreSQL behave consistently.
+        Auto-generated names are excluded because the normal generator already finds
+        a unique value before staging.
+        """
+        if self._physical_owner_cache is None or self._physical_by_prj_cache is None:
+            self.prepare_bulk_cache(payloads)
+
+        incoming: dict[str, dict[str, Any]] = {}
+        for payload in payloads:
+            physical_name = normalize_text(payload.prj_physical_attribute_name)
+            physical_source = normalize_text(payload.physical_name_source).upper()
+            prj_id = normalize_text(payload.prj_id)
+            if not physical_name or physical_source == "AUTO" or not prj_id:
+                continue
+            entry = incoming.setdefault(
+                physical_name.casefold(),
+                {"physical_attribute_name": physical_name, "incoming_ids": {}},
+            )
+            entry["incoming_ids"].setdefault(self._prj_identity_key(prj_id), prj_id)
+
+        duplicates: list[dict[str, Any]] = []
+        for name_key, entry in incoming.items():
+            incoming_ids: dict[str, str] = entry["incoming_ids"]
+            existing_owner = None if self._physical_owner_cache is None else self._physical_owner_cache.get(name_key)
+            distinct_id_keys = set(incoming_ids)
+            if existing_owner:
+                distinct_id_keys.add(self._prj_identity_key(existing_owner))
+            if len(distinct_id_keys) <= 1:
+                continue
+
+            all_ids: dict[str, str] = dict(incoming_ids)
+            if existing_owner:
+                all_ids.setdefault(self._prj_identity_key(existing_owner), str(existing_owner))
+            duplicates.append(
+                {
+                    "physical_attribute_name": entry["physical_attribute_name"],
+                    "cfv_ids": sorted(all_ids.values(), key=str.casefold),
+                    "incoming_cfv_ids": sorted(incoming_ids.values(), key=str.casefold),
+                    "existing_database_cfv_id": str(existing_owner) if existing_owner else None,
+                }
+            )
+
+        if duplicates:
+            duplicates.sort(key=lambda row: str(row["physical_attribute_name"]).casefold())
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "Duplicate PRJ Physical Attribute Name values were found. "
+                        "MERGE/REPLACE was not staged. Each physical attribute name must belong to only one CFV ID."
+                    ),
+                    "duplicates": duplicates,
+                },
+            )
 
     def _portfolio_ref_cached(self, value: str) -> dict[str, Any] | None:
         label = canonical_portfolio_label(value)
@@ -117,28 +187,38 @@ class DataDictionaryService:
             return self._original_type_cache.get(prj_id)
         return self.repo.original_mapping_type(prj_id)
 
+    @staticmethod
+    def _prj_identity_key(prj_id: str | None) -> str:
+        return normalize_text(prj_id).casefold()
+
     def _physical_name_cached(self, prj_id: str) -> str | None:
         if self._physical_by_prj_cache is not None:
-            return self._physical_by_prj_cache.get(prj_id)
+            return self._physical_by_prj_cache.get(self._prj_identity_key(prj_id))
         return self.repo.physical_name_for_prj(prj_id)
 
     def _physical_exists_cached(self, name: str, exclude_prj_id: str | None = None) -> bool:
         if self._physical_owner_cache is None:
             return self.repo.physical_name_exists(name, exclude_prj_id=exclude_prj_id)
         owner = self._physical_owner_cache.get(name.casefold())
-        return bool(owner and owner != exclude_prj_id)
+        return bool(owner and self._prj_identity_key(owner) != self._prj_identity_key(exclude_prj_id))
+
+    def _reserve_physical_cached(self, name: str, prj_id: str) -> None:
+        """Reserve an accepted physical name inside the current bulk operation."""
+        if self._physical_owner_cache is not None:
+            self._physical_owner_cache[name.casefold()] = prj_id
+        if self._physical_by_prj_cache is not None:
+            self._physical_by_prj_cache[self._prj_identity_key(prj_id)] = name
 
     def _available_physical_cached(self, base_name: str, prj_id: str) -> str:
         if self._physical_owner_cache is None:
             return self.repo.available_physical_name(base_name, exclude_prj_id=prj_id)
         base = base_name.strip() or "attribute"
         for suffix in range(1, 10001):
-            candidate = base if suffix == 1 else f"{base[:500-len(str(suffix))-1]} {suffix}"
+            suffix_text = "" if suffix == 1 else f"_{suffix}"
+            candidate = base if suffix == 1 else f"{base[:500-len(suffix_text)]}{suffix_text}"
             owner = self._physical_owner_cache.get(candidate.casefold())
-            if not owner or owner == prj_id:
-                self._physical_owner_cache[candidate.casefold()] = prj_id
-                if self._physical_by_prj_cache is not None:
-                    self._physical_by_prj_cache[prj_id] = candidate
+            if not owner or self._prj_identity_key(owner) == self._prj_identity_key(prj_id):
+                self._reserve_physical_cached(candidate, prj_id)
                 return candidate
         raise ValueError(f"Could not generate a unique PRJ Physical Attribute Name from '{base}'.")
 
@@ -178,7 +258,9 @@ class DataDictionaryService:
             raise HTTPException(status_code=404, detail=f"PRJ ID {prj_id} was not found in staging or the final dictionary.")
         return detail
 
-    def _make_rows(self, payload: AttributeUpsert) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    def _make_rows(
+        self, payload: AttributeUpsert, *, bulk_physical_policy: bool = False
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         prj_id = normalize_text(payload.prj_id) or self.repo.next_prj_id()
         portfolio_label = canonical_portfolio_label(payload.portfolio)
         portfolio = self._portfolio_ref_cached(portfolio_label)
@@ -188,12 +270,14 @@ class DataDictionaryService:
         physical_name = normalize_text(payload.prj_physical_attribute_name)
         physical_source = normalize_text(payload.physical_name_source).upper()
         auto_physical = physical_source == "AUTO" or not physical_name
+        existing_physical = self._physical_name_cached(prj_id)
+
         if auto_physical:
             # Blank bulk/UI input must not erase an existing physical name. For a
             # new PRJ ID, generate a deterministic unique variant from the acronym.
-            existing_physical = self._physical_name_cached(prj_id)
             if existing_physical:
                 physical_name = existing_physical
+                self._reserve_physical_cached(physical_name, prj_id)
             else:
                 base_physical_name = physical_name or generate_physical_name(payload.prj_attribute_name)
                 if not base_physical_name:
@@ -203,13 +287,18 @@ class DataDictionaryService:
                 except ValueError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
         elif self._physical_exists_cached(physical_name, exclude_prj_id=prj_id):
+            # Explicitly supplied Excel/UI names are never auto-renamed.  Bulk
+            # callers prevalidate the complete workbook so their 409 response can
+            # list every conflicting CFV ID in one readable message.
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"PRJ Physical Attribute Name '{physical_name}' already exists for another PRJ ID. "
-                    "An explicitly supplied Excel/UI physical name is preserved and cannot duplicate another attribute."
+                    "Choose a unique physical name or use a generated suggestion."
                 ),
             )
+        else:
+            self._reserve_physical_cached(physical_name, prj_id)
 
         original_type = self._original_mapping_type_cached(prj_id)
         mapping_type = mapping_type_from_value(payload.calculated_or_reported, original_type)
@@ -218,15 +307,56 @@ class DataDictionaryService:
             source_abbr_name = self._source_code_cached(payload.source_name, payload.source_abbr_name)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        calculation_logic = payload.calculation_logic if payload.calculation_logic is not None else "NA"
-        calculation_logic = calculation_logic if str(calculation_logic).strip() else "NA"
-        tech_logic = normalize_text(payload.tech_logic) or generate_tech_logic(calculation_logic)
-        segment = normalize_text(payload.segment) or "NA"
-        display_name = normalize_text(payload.display_name) or normalize_text(payload.prj_attribute_name)
         section = normalize_pipe_values(payload.section)
         subsection = normalize_pipe_values(payload.sub_section)
         if not section or not subsection:
             raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
+        try:
+            scope_pairs = pair_pipe_values(section, subsection)
+            pair_count = len(scope_pairs)
+            segment_values = align_pipe_values(payload.segment, pair_count, "Segment", default="NA")
+            definition_values = align_pipe_values(payload.attribute_definition, pair_count, "Attribute Definition", default=None)
+            description_values = align_pipe_values(payload.attribute_description, pair_count, "Attribute Description", default=None)
+            calculation_values = align_pipe_values(payload.calculation_logic, pair_count, "Calculation Logic", default="NA")
+            report_type_values = align_pipe_values(payload.report_type, pair_count, "Report Type", default="NA")
+            display_order_values = align_int_pipe_values(payload.display_order, pair_count, "Display Order", default=0)
+            supplied_tech_values = align_pipe_values(payload.tech_logic, pair_count, "Tech Logic", default=None)
+            display_name_values = align_pipe_values(
+                payload.display_name, pair_count, "Display Name", default=normalize_text(payload.prj_attribute_name)
+            )
+            examples_values = align_pipe_values(payload.examples, pair_count, "Examples", default=None)
+            prompt_source = payload.prompt_description if payload.prompt_description is not None else payload.attribute_description
+            prompt_values = align_pipe_values(prompt_source, pair_count, "Prompt Description", default=None)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        calculation_values = [str(value or "NA") for value in calculation_values]
+        report_type_values = [normalize_text(value) or "NA" for value in report_type_values]
+        tech_values = [
+            normalize_text(supplied_tech_values[index]) or generate_tech_logic(calculation_values[index])
+            for index in range(pair_count)
+        ]
+        display_name_values = [
+            normalize_text(value) or normalize_text(payload.prj_attribute_name) for value in display_name_values
+        ]
+
+        def serialize_scoped(values: list[Any], default: Any = None) -> Any:
+            if not values:
+                return default
+            if len(values) == 1:
+                return values[0] if values[0] is not None else default
+            return "|".join("" if value is None else str(value) for value in values)
+
+        segment = str(serialize_scoped(segment_values, "NA") or "NA")
+        attribute_definition = serialize_scoped(definition_values)
+        attribute_description = serialize_scoped(description_values)
+        calculation_logic = str(serialize_scoped(calculation_values, "NA") or "NA")
+        report_type = str(serialize_scoped(report_type_values, "NA") or "NA")
+        display_order = serialize_scoped(display_order_values, 0)
+        tech_logic = serialize_scoped(tech_values)
+        display_name = serialize_scoped(display_name_values, normalize_text(payload.prj_attribute_name))
+        examples = serialize_scoped(examples_values)
+        prompt_description = serialize_scoped(prompt_values)
 
         raw = {
             "portfolio": portfolio["sector_name"] if portfolio["portfolio_name"] == "FI" else portfolio["portfolio_name"],
@@ -237,18 +367,19 @@ class DataDictionaryService:
             "sub_section": subsection,
             "data_type": normalize_text(payload.data_type) or None,
             "calculated_or_reported": normalize_text(payload.calculated_or_reported),
-            "calculation_logic": str(calculation_logic),
+            "calculation_logic": calculation_logic,
             "segment": segment,
-            "attribute_definition": payload.attribute_definition,
-            "attribute_description": payload.attribute_description,
-            "display_order": int(payload.display_order),
+            "report_type": report_type,
+            "attribute_definition": attribute_definition,
+            "attribute_description": attribute_description,
+            "display_order": display_order,
             "tech_logic": tech_logic,
             "display_name": display_name,
         }
         master = {
             "prj_id": prj_id,
             "prj_attribute_name": raw["prj_attribute_name"],
-            "prj_attribute_definition": payload.attribute_definition,
+            "prj_attribute_definition": attribute_definition,
             "prj_physical_attribute_name": physical_name,
             # Requirement explicitly maps this master field from Segment.
             "where_in_financial_statement": segment,
@@ -261,15 +392,18 @@ class DataDictionaryService:
             "editable": editable,
             "symbol": normalize_text(payload.data_type) or None,
             "mapping_type": mapping_type,
-            "calculation_logic": str(calculation_logic),
-            "prj_attribute_description": payload.attribute_description,
+            "calculation_logic": calculation_logic,
+            "prj_attribute_definition": attribute_definition,
+            "prj_attribute_description": attribute_description,
+            "segment": segment,
+            "report_type": report_type,
             "tech_logic": tech_logic,
-            "display_order": int(payload.display_order),
+            "display_order": display_order,
             "display_name": display_name,
             "section": section,
             "subsection": subsection,
-            "prompt_description": payload.prompt_description if payload.prompt_description is not None else payload.attribute_description,
-            "examples": payload.examples,
+            "prompt_description": prompt_description,
+            "examples": examples,
             "is_active": bool(payload.is_active),
         }
         return raw, master, rule
@@ -283,11 +417,31 @@ class DataDictionaryService:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not pairs:
             raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
+        pair_count = len(pairs)
+        try:
+            segments = align_pipe_values(raw.get("segment"), pair_count, "Segment", default="NA")
+            definitions = align_pipe_values(raw.get("attribute_definition"), pair_count, "Attribute Definition", default=None)
+            descriptions = align_pipe_values(raw.get("attribute_description"), pair_count, "Attribute Description", default=None)
+            calculations = align_pipe_values(raw.get("calculation_logic"), pair_count, "Calculation Logic", default="NA")
+            report_types = align_pipe_values(raw.get("report_type"), pair_count, "Report Type", default="NA")
+            display_orders = align_int_pipe_values(raw.get("display_order"), pair_count, "Display Order", default=0)
+            tech_logics = align_pipe_values(raw.get("tech_logic"), pair_count, "Tech Logic", default=None)
+            display_names = align_pipe_values(raw.get("display_name"), pair_count, "Display Name", default=None)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         rows: list[dict[str, Any]] = []
-        for section, subsection in pairs:
+        for index, (section, subsection) in enumerate(pairs):
             expanded = dict(raw)
             expanded["section"] = section
             expanded["sub_section"] = subsection
+            expanded["segment"] = segments[index]
+            expanded["attribute_definition"] = definitions[index]
+            expanded["attribute_description"] = descriptions[index]
+            expanded["calculation_logic"] = calculations[index] or "NA"
+            expanded["report_type"] = report_types[index] or "NA"
+            expanded["display_order"] = display_orders[index]
+            expanded["tech_logic"] = tech_logics[index] or generate_tech_logic(expanded["calculation_logic"])
+            expanded["display_name"] = display_names[index]
             rows.append(expanded)
         return rows
 
@@ -300,11 +454,35 @@ class DataDictionaryService:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not pairs:
             raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
+        pair_count = len(pairs)
+        try:
+            definitions = align_pipe_values(rule.get("prj_attribute_definition"), pair_count, "Attribute Definition", default=None)
+            descriptions = align_pipe_values(rule.get("prj_attribute_description"), pair_count, "Attribute Description", default=None)
+            segments = align_pipe_values(rule.get("segment"), pair_count, "Segment", default="NA")
+            calculations = align_pipe_values(rule.get("calculation_logic"), pair_count, "Calculation Logic", default="NA")
+            report_types = align_pipe_values(rule.get("report_type"), pair_count, "Report Type", default="NA")
+            display_orders = align_int_pipe_values(rule.get("display_order"), pair_count, "Display Order", default=0)
+            tech_logics = align_pipe_values(rule.get("tech_logic"), pair_count, "Tech Logic", default=None)
+            display_names = align_pipe_values(rule.get("display_name"), pair_count, "Display Name", default=None)
+            examples = align_pipe_values(rule.get("examples"), pair_count, "Examples", default=None)
+            prompts = align_pipe_values(rule.get("prompt_description"), pair_count, "Prompt Description", default=None)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         rows: list[dict[str, Any]] = []
-        for section, subsection in pairs:
+        for index, (section, subsection) in enumerate(pairs):
             expanded = dict(rule)
             expanded["section"] = section
             expanded["subsection"] = subsection
+            expanded["prj_attribute_definition"] = definitions[index]
+            expanded["prj_attribute_description"] = descriptions[index]
+            expanded["segment"] = segments[index]
+            expanded["calculation_logic"] = calculations[index] or "NA"
+            expanded["report_type"] = report_types[index] or "NA"
+            expanded["display_order"] = display_orders[index]
+            expanded["tech_logic"] = tech_logics[index] or generate_tech_logic(expanded["calculation_logic"])
+            expanded["display_name"] = display_names[index]
+            expanded["examples"] = examples[index]
+            expanded["prompt_description"] = prompts[index]
             rows.append(expanded)
         return rows
 
@@ -425,9 +603,10 @@ class DataDictionaryService:
         if not payloads:
             return []
         self.prepare_bulk_cache(payloads)
+        self.validate_bulk_physical_name_uniqueness(payloads)
         prepared: list[tuple[AttributeUpsert, list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]] = []
         for payload in payloads:
-            raw, master, rule = self._make_rows(payload)
+            raw, master, rule = self._make_rows(payload, bulk_physical_policy=True)
             prepared.append((payload, self._expand_raw_pairs(raw), master, self._expand_rule_pairs(rule)))
 
         caches = self.repo.preload_pending_objects({master["prj_id"] for _, _, master, _ in prepared})
@@ -496,7 +675,10 @@ class DataDictionaryService:
             "symbol": "Data Type",
             "mapping_type": "Calculated / Reported",
             "calculation_logic": "Calculation Logic",
+            "prj_attribute_definition": "Attribute Definition",
             "prj_attribute_description": "Attribute Description",
+            "segment": "Segment",
+            "report_type": "Report Type",
             "tech_logic": "Tech Logic",
             "display_order": "Display Order",
             "display_name": "Display Name",
@@ -525,9 +707,10 @@ class DataDictionaryService:
 
     def compare_upload(self, payloads: list[AttributeUpsert], include_missing_deleted: bool = False) -> dict[str, Any]:
         self.prepare_bulk_cache(payloads)
+        self.validate_bulk_physical_name_uniqueness(payloads)
         uploaded: dict[str, dict[str, Any]] = {}
         for payload in payloads:
-            _, master, rule = self._make_rows(payload)
+            _, master, rule = self._make_rows(payload, bulk_physical_policy=True)
             bucket = uploaded.setdefault(
                 master["prj_id"],
                 {"master": master, "rules": [], "attribute_name": master["prj_attribute_name"]},
@@ -557,6 +740,7 @@ class DataDictionaryService:
                         and int(row["display_order"]) == int(incoming["display_order"])
                         and row["section"] == incoming["section"]
                         and row["subsection"] == incoming["subsection"]
+                        and row.get("report_type", "NA") == incoming.get("report_type", "NA")
                     ),
                     None,
                 )
@@ -714,6 +898,7 @@ class DataDictionaryService:
                         and int(candidate["display_order"]) == int(row["display_order"])
                         and candidate["section"] == row["section"]
                         and candidate["subsection"] == row["subsection"]
+                        and candidate.get("report_type", "NA") == row.get("report_type", "NA")
                     ),
                     None,
                 )
@@ -798,6 +983,7 @@ class DataDictionaryService:
             and int(rule.display_order) == int(staged.get("display_order") or 0)
             and rule.section == staged.get("section")
             and rule.subsection == staged.get("subsection")
+            and rule.report_type == staged.get("report_type", "NA")
         )
 
     def _upsert_final_rule(self, staged: dict[str, Any], user: str, strict_key: bool = False) -> None:
@@ -830,7 +1016,10 @@ class DataDictionaryService:
             "symbol",
             "mapping_type",
             "calculation_logic",
+            "prj_attribute_definition",
             "prj_attribute_description",
+            "segment",
+            "report_type",
             "tech_logic",
             "display_order",
             "display_name",
@@ -953,6 +1142,7 @@ class DataDictionaryService:
                     "source_abbr_name": rule.source_abbr_name,
                     "section": rule.section,
                     "subsection": rule.subsection,
+                    "report_type": rule.report_type,
                     "display_name": rule.display_name,
                     "prompt_description": rule.prompt_description,
                     "examples": rule.examples,

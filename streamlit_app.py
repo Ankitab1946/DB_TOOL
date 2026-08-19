@@ -96,6 +96,18 @@ def headers() -> dict[str, str]:
     }
 
 
+def format_api_error_detail(detail: Any) -> str:
+    """Render structured bulk duplicate errors in a user-readable form."""
+    if isinstance(detail, dict) and detail.get("duplicates"):
+        lines = [str(detail.get("message") or "Duplicate values were found.")]
+        for item in detail.get("duplicates", []):
+            name = item.get("physical_attribute_name") or "<blank>"
+            cfv_ids = ", ".join(str(value) for value in item.get("cfv_ids", [])) or "Unknown"
+            lines.append(f"• {name}: duplicate across CFV IDs {cfv_ids}")
+        return "\n".join(lines)
+    return str(detail)
+
+
 def api(method: str, path: str, *, quiet: bool = False, binary: bool = False, **kwargs):
     timeout = READ_TIMEOUT if method.upper() == "GET" else WRITE_TIMEOUT
     try:
@@ -110,7 +122,7 @@ def api(method: str, path: str, *, quiet: bool = False, binary: bool = False, **
                 detail = response.json().get("detail", response.json())
             except Exception:
                 detail = response.text
-            st.error(f"API error {response.status_code}: {detail}")
+            st.error(f"API error {response.status_code}: {format_api_error_detail(detail)}")
         return None
     return response if binary else response.json()
 

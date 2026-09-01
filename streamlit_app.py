@@ -373,17 +373,29 @@ with st.sidebar:
     if not refreshed.get("database_enabled", False):
         st.warning("Database access is disabled for this environment.")
 
-lookup_key = f"{st.session_state['environment']}:{st.session_state['database_type']}"
+# Include a lookup contract revision so an already-running Streamlit session does
+# not retain an empty PostgreSQL reference cache from a previous application build.
+lookup_key = f"{st.session_state['environment']}:{st.session_state['database_type']}:reference-v2"
 if st.session_state.get("lookup_cache_key") != lookup_key or st.session_state.get("lookup_cache") is None:
-    st.session_state["lookup_cache"] = api("GET", "/lookups", quiet=True) or {
+    combined = api("GET", "/lookups", quiet=True) or {
         "portfolios": [], "sources": [], "sections": [], "subsections": []
     }
+    if st.session_state.get("database_type") == "POSTGRES":
+        # PostgreSQL Portfolio/Scope and Source are authoritative physical-table
+        # lookups. Fetch them independently so a failure in Section/Sub-Section
+        # lookup cannot suppress valid reference data.
+        direct_portfolios = api("GET", "/lookups/portfolios", quiet=False)
+        direct_sources = api("GET", "/lookups/sources", quiet=False)
+        combined = dict(combined)
+        combined["portfolios"] = direct_portfolios or []
+        combined["sources"] = direct_sources or []
+    st.session_state["lookup_cache"] = combined
     st.session_state["lookup_cache_key"] = lookup_key
 lookups = st.session_state.get("lookup_cache") or {"portfolios": [], "sources": [], "sections": [], "subsections": []}
-# Portfolio retrieval is intentionally independent from the combined /lookups
-# response. A failure while loading sections/subsections/sources must not make a
-# populated PostgreSQL prj_dbd.prj_portfolio_reference table appear empty.
-if not lookups.get("portfolios"):
+
+# SQL Server keeps the backward-compatible fallback when the combined lookup is
+# empty. PostgreSQL is already loaded from its dedicated endpoints above.
+if st.session_state.get("database_type") != "POSTGRES" and not lookups.get("portfolios"):
     direct_portfolios = api("GET", "/lookups/portfolios", quiet=True)
     if direct_portfolios:
         lookups = dict(lookups)
@@ -501,9 +513,14 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     portfolio = c1.selectbox("Portfolio / Scope *", p_options, index=p_index, disabled=locked, key=f"{prefix}_portfolio")
     src_code = str(rule.get("source_abbr_name") or (source_options[0] if source_options else "SNPAR"))
     s_options = list(source_options)
-    if src_code and src_code not in s_options:
+    if src_code and src_code not in s_options and (detail or st.session_state.get("database_type") != "POSTGRES"):
         s_options.insert(0, src_code)
-    s_options = s_options or ["SNPAR"]
+    if not s_options:
+        if st.session_state.get("database_type") == "POSTGRES":
+            c2.error("No Source values returned from prj_dbd.prj_data_sources.")
+            s_options = [""]
+        else:
+            s_options = ["SNPAR"]
     s_index = s_options.index(src_code) if src_code in s_options else 0
     source_code = c2.selectbox("Source *", s_options, index=s_index, format_func=source_label, disabled=locked, key=f"{prefix}_source")
     current_symbol = str(rule.get("symbol") or "Amount")

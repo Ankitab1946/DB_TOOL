@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import inspect
+import json
 from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select, true
+from sqlalchemy import MetaData, Table, delete, insert, select, true, update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -1071,12 +1072,280 @@ class DataDictionaryService:
             None, model_dict(display), user, "FINALIZE",
         )
 
+    @staticmethod
+    def _pg_row_dict(row: Any, business: Table, display: Table) -> dict[str, Any]:
+        """Convert a physical PostgreSQL business/display join row to the legacy rule shape."""
+        m = row._mapping
+        return {
+            "scope_id": m[business.c.scope_id],
+            "prj_id": m[business.c.prj_id],
+            "port_ref_id": m[business.c.port_ref_id],
+            "source_abbr_name": m[business.c.source_abbr_name],
+            "prompt_description": m[business.c.prompt_description],
+            "examples": m[business.c.examples_for_llm],
+            "editable": m[business.c.editable],
+            "symbol": m[business.c.data_type],
+            "mapping_type": m[business.c.attribute_type],
+            "tech_logic": m[business.c.business_logic],
+            "calculation_logic": m[business.c.calculation_logic],
+            "display_id": m[display.c.display_id],
+            "display_order": m[display.c.display_order],
+            "display_name": m[display.c.display_name],
+            "section": m[display.c.section],
+            "subsection": m[display.c.subsection],
+            "prj_attribute_definition": m[display.c.prj_attribute_definition],
+            "prj_attribute_description": m[display.c.prj_attribute_description],
+            "segment": m[display.c.segment],
+            "report_type": m[display.c.report_type],
+            "is_active": True,
+        }
+
+    def _postgres_finalize_tables(self) -> dict[str, Table]:
+        """Reflect the physical PostgreSQL publication tables used by Finalize.
+
+        Finalize is intentionally physical-schema based for PostgreSQL.  This avoids
+        coupling publication to the SQL Server logical ``dbo/stg`` ORM names and to
+        the legacy SQL Server portfolio table name.
+        """
+        bind = self.db.get_bind()
+        metadata = MetaData()
+        specs = {
+            "stg_master": ("prj_stage", "prj_attribute_master_new_test"),
+            "stg_business": ("prj_stage", "prj_attribute_business_rules_new_test"),
+            "stg_display": ("prj_stage", "prj_attribute_display_test"),
+            "final_master": ("prj_dbd", "prj_attribute_master_new_test"),
+            "final_business": ("prj_dbd", "prj_attribute_business_rules_new_test"),
+            "final_display": ("prj_dbd", "prj_attribute_display_test"),
+            "audit": ("prj_dbd", "audit_table_new_test"),
+            "portfolio": ("prj_dbd", "prj_portfolio_reference"),
+        }
+        tables: dict[str, Table] = {}
+        try:
+            for key, (schema, name) in specs.items():
+                tables[key] = Table(name, metadata, schema=schema, autoload_with=bind)
+        except SQLAlchemyError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "PostgreSQL Finalize schema is not ready. Required physical tables are under "
+                    "prj_stage/prj_dbd, including prj_dbd.prj_portfolio_reference. "
+                    f"Database error: {str(getattr(exc, 'orig', exc))[:1200]}"
+                ),
+            ) from exc
+
+        required_columns = {
+            "stg_master": {"prj_id", "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name", "where_in_financial_statement", "is_active"},
+            "final_master": {"prj_id", "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name", "where_in_financial_statement", "is_active"},
+            "stg_business": {"scope_id", "prj_id", "port_ref_id", "source_abbr_name", "prompt_description", "examples_for_llm", "editable", "data_type", "attribute_type", "business_logic", "calculation_logic"},
+            "final_business": {"scope_id", "prj_id", "port_ref_id", "source_abbr_name", "prompt_description", "examples_for_llm", "editable", "data_type", "attribute_type", "business_logic", "calculation_logic"},
+            "stg_display": {"display_id", "scope_id", "display_order", "prj_id", "display_name", "section", "subsection", "prj_attribute_definition", "prj_attribute_description", "segment", "report_type"},
+            "final_display": {"display_id", "scope_id", "display_order", "prj_id", "display_name", "section", "subsection", "prj_attribute_definition", "prj_attribute_description", "segment", "report_type"},
+            "portfolio": {"port_ref_id"},
+            "audit": {"schema_name", "table_name", "record_key", "action", "before_value", "after_value", "source_operation", "performed_by", "performed_at"},
+        }
+        missing: list[str] = []
+        for key, expected in required_columns.items():
+            actual = set(tables[key].c.keys())
+            for column in sorted(expected - actual):
+                missing.append(f"{tables[key].schema}.{tables[key].name}.{column}")
+        if missing:
+            raise HTTPException(
+                status_code=503,
+                detail="PostgreSQL Finalize schema is missing required column(s): " + ", ".join(missing),
+            )
+        return tables
+
+    def _postgres_audit(self, audit: Table, schema_name: str, table_name: str, record_key: Any,
+                        action: str, before: Any, after: Any, user: str) -> None:
+        self.db.execute(
+            insert(audit).values(
+                schema_name=schema_name,
+                table_name=table_name,
+                record_key=str(record_key),
+                action=action,
+                before_value=None if before is None else json.dumps(before, default=str, ensure_ascii=False, sort_keys=True),
+                after_value=None if after is None else json.dumps(after, default=str, ensure_ascii=False, sort_keys=True),
+                source_operation="FINALIZE",
+                performed_by=user,
+                performed_at=datetime.utcnow(),
+            )
+        )
+
+    def _finalize_postgres(self, user: str, delta: dict[str, Any]) -> dict[str, Any]:
+        """Publish staging rows using PostgreSQL's physical prj_stage/prj_dbd contract."""
+        t = self._postgres_finalize_tables()
+        sm, sb, sd = t["stg_master"], t["stg_business"], t["stg_display"]
+        fm, fb, fd, audit = t["final_master"], t["final_business"], t["final_display"], t["audit"]
+        portfolio = t["portfolio"]
+        prj_ids = [row["prj_id"] for row in delta["rows"]]
+        now = datetime.utcnow()
+
+        # Validate staged portfolio references up-front against the canonical
+        # PostgreSQL reference table so failures are descriptive and atomic.
+        staged_ports = set(
+            int(v) for v in self.db.scalars(
+                select(sb.c.port_ref_id).where(sb.c.prj_id.in_(prj_ids)).distinct()
+            ).all() if v is not None
+        )
+        valid_ports = set(
+            int(v) for v in self.db.scalars(
+                select(portfolio.c.port_ref_id).where(portfolio.c.port_ref_id.in_(staged_ports))
+            ).all()
+        ) if staged_ports else set()
+        missing_ports = sorted(staged_ports - valid_ports)
+        if missing_ports:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Finalize blocked because staged Portfolio/Scope IDs are not present in "
+                    "prj_dbd.prj_portfolio_reference: " + ", ".join(map(str, missing_ports))
+                ),
+            )
+
+        for prj_id in prj_ids:
+            staged_master = self.db.execute(select(sm).where(sm.c.prj_id == prj_id)).mappings().first()
+            if not staged_master:
+                continue
+            staged_master = dict(staged_master)
+            existing_master = self.db.execute(select(fm).where(fm.c.prj_id == prj_id)).mappings().first()
+            master_values = {
+                "prj_attribute_name": staged_master.get("prj_attribute_name"),
+                "prj_attribute_definition": staged_master.get("prj_attribute_definition"),
+                "prj_physical_attribute_name": staged_master.get("prj_physical_attribute_name"),
+                "where_in_financial_statement": staged_master.get("where_in_financial_statement") or "NA",
+                "is_active": bool(staged_master.get("is_active")),
+                "updated_at": now,
+                "updated_by": user,
+            }
+            if existing_master:
+                before = dict(existing_master)
+                self.db.execute(update(fm).where(fm.c.prj_id == prj_id).values(**master_values))
+                after = dict(before); after.update(master_values)
+                self._postgres_audit(audit, "prj_dbd", fm.name, prj_id, "UPDATE", before, after, user)
+            else:
+                insert_values = {"prj_id": prj_id, **master_values, "created_at": now, "created_by": user}
+                self.db.execute(insert(fm).values(**insert_values))
+                self._postgres_audit(audit, "prj_dbd", fm.name, prj_id, "INSERT", None, insert_values, user)
+
+            if not bool(staged_master.get("is_active")):
+                continue
+
+            staged_rows = self.db.execute(
+                select(sb, sd)
+                .join(sd, sd.c.scope_id == sb.c.scope_id)
+                .where(sb.c.prj_id == prj_id)
+                .order_by(sb.c.scope_id)
+            ).all()
+            seen_ports: dict[int, int] = {}
+            for raw_row in staged_rows:
+                staged = self._pg_row_dict(raw_row, sb, sd)
+                port_ref_id = int(staged["port_ref_id"])
+                final_rows = self.db.execute(
+                    select(fb, fd)
+                    .join(fd, fd.c.scope_id == fb.c.scope_id)
+                    .where(fb.c.prj_id == prj_id, fb.c.port_ref_id == port_ref_id)
+                    .order_by(fb.c.scope_id)
+                ).all()
+                candidates = [self._pg_row_dict(row, fb, fd) for row in final_rows]
+                exact = next(
+                    (row for row in candidates if
+                     row.get("source_abbr_name") == staged.get("source_abbr_name")
+                     and int(row.get("display_order") or 0) == int(staged.get("display_order") or 0)
+                     and row.get("section") == staged.get("section")
+                     and row.get("subsection") == staged.get("subsection")
+                     and (row.get("report_type") or "NA") == (staged.get("report_type") or "NA")),
+                    None,
+                )
+                strict_key = seen_ports.get(port_ref_id, 0) > 0
+                target = exact or (candidates[0] if len(candidates) == 1 and not strict_key else None)
+                if len(candidates) > 1 and exact is None and not strict_key:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Cannot unambiguously update final PostgreSQL scope for {prj_id} / "
+                            f"port_ref_id {port_ref_id}. Multiple scopes exist and the edited key no longer matches."
+                        ),
+                    )
+
+                business_values = {
+                    "prj_id": prj_id,
+                    "port_ref_id": port_ref_id,
+                    "source_abbr_name": staged.get("source_abbr_name"),
+                    "prompt_description": staged.get("prompt_description"),
+                    "examples_for_llm": staged.get("examples"),
+                    "editable": staged.get("editable"),
+                    "data_type": staged.get("symbol"),
+                    "attribute_type": staged.get("mapping_type"),
+                    "business_logic": staged.get("tech_logic"),
+                    "calculation_logic": staged.get("calculation_logic") or "NA",
+                    "updated_at": now,
+                    "updated_by": user,
+                }
+                display_values = {
+                    "display_order": int(staged.get("display_order") or 0),
+                    "prj_id": prj_id,
+                    "display_name": staged.get("display_name"),
+                    "section": staged.get("section"),
+                    "subsection": staged.get("subsection"),
+                    "prj_attribute_definition": staged.get("prj_attribute_definition"),
+                    "prj_attribute_description": staged.get("prj_attribute_description"),
+                    "segment": staged.get("segment") or "NA",
+                    "report_type": staged.get("report_type") or "NA",
+                    "updated_at": now,
+                    "updated_by": user,
+                }
+                if target:
+                    scope_id = int(target["scope_id"])
+                    display_id = int(target["display_id"])
+                    before_business = self.db.execute(select(fb).where(fb.c.scope_id == scope_id)).mappings().one()
+                    before_display = self.db.execute(select(fd).where(fd.c.display_id == display_id)).mappings().one()
+                    self.db.execute(update(fb).where(fb.c.scope_id == scope_id).values(**business_values))
+                    self.db.execute(update(fd).where(fd.c.display_id == display_id).values(**display_values))
+                    after_business = dict(before_business); after_business.update(business_values)
+                    after_display = dict(before_display); after_display.update(display_values)
+                    self._postgres_audit(audit, "prj_dbd", fb.name, scope_id, "UPDATE", dict(before_business), after_business, user)
+                    self._postgres_audit(audit, "prj_dbd", fd.name, display_id, "UPDATE", dict(before_display), after_display, user)
+                else:
+                    b_insert = {**business_values, "created_at": now, "created_by": user}
+                    scope_id = int(self.db.execute(insert(fb).values(**b_insert).returning(fb.c.scope_id)).scalar_one())
+                    d_insert = {**display_values, "scope_id": scope_id, "created_at": now, "created_by": user}
+                    display_id = int(self.db.execute(insert(fd).values(**d_insert).returning(fd.c.display_id)).scalar_one())
+                    self._postgres_audit(audit, "prj_dbd", fb.name, scope_id, "INSERT", None, {"scope_id": scope_id, **b_insert}, user)
+                    self._postgres_audit(audit, "prj_dbd", fd.name, display_id, "INSERT", None, {"display_id": display_id, **d_insert}, user)
+                seen_ports[port_ref_id] = seen_ports.get(port_ref_id, 0) + 1
+
+        # Clear only the PRJ IDs that were successfully published.  Child display
+        # rows are deleted first to satisfy the staging FK relationship.
+        scope_subquery = select(sb.c.scope_id).where(sb.c.prj_id.in_(prj_ids))
+        self.db.execute(delete(sd).where(sd.c.scope_id.in_(scope_subquery)))
+        self.db.execute(delete(sb).where(sb.c.prj_id.in_(prj_ids)))
+        self.db.execute(delete(sm).where(sm.c.prj_id.in_(prj_ids)))
+        self.db.commit()
+        return {"updated": len(prj_ids), "delta": delta, "message": "Database tables updated successfully."}
+
     def finalize(self, user: str, confirm: bool) -> dict[str, Any]:
         if not confirm:
             raise HTTPException(status_code=400, detail="Finalization requires confirm=true.")
         delta = self.delta()
         if not delta["has_changes"]:
             return {"updated": 0, "delta": delta, "message": "No staged changes to finalize."}
+
+        if self.db.get_bind().dialect.name == "postgresql":
+            try:
+                return self._finalize_postgres(user, delta)
+            except HTTPException:
+                self.db.rollback()
+                raise
+            except IntegrityError as exc:
+                self.db.rollback()
+                raise HTTPException(status_code=409, detail=f"PostgreSQL finalization constraint failed: {exc.orig}") from exc
+            except SQLAlchemyError as exc:
+                self.db.rollback()
+                detail = str(getattr(exc, "orig", exc))[:1500]
+                raise HTTPException(status_code=500, detail=f"PostgreSQL finalization failed: {detail}") from exc
+            except Exception as exc:
+                self.db.rollback()
+                raise HTTPException(status_code=500, detail=f"PostgreSQL finalization failed: {str(exc)[:1500]}") from exc
 
         prj_ids = [row["prj_id"] for row in delta["rows"]]
         try:

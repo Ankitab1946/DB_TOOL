@@ -417,57 +417,32 @@ cleanup_modal = Modal("Cleanup Database", key="cleanup_database_modal", max_widt
 
 
 def render_attribute_modal_style(modal_key: str) -> None:
-    """Center Create/Edit modals and make them nearly full-screen.
+    """Center Create/Edit without changing the modal library's overlay/card hierarchy.
 
-    ``streamlit-modal`` injects its stylesheet when ``container()`` is entered,
-    so this override is intentionally rendered *inside* the modal afterwards.
-    That makes the centering/width rules deterministic instead of depending on
-    stylesheet order from the main page.
+    The previous override forced the modal wrapper and its first child into a
+    custom fixed/grid layout.  On some Streamlit/browser combinations that
+    placed the grey backdrop above the actual form, so the page appeared
+    disabled and none of the Create/Edit controls could be clicked.
+
+    ``streamlit-modal`` already owns backdrop, z-index, width and interaction.
+    Only vertically center the keyed modal container and constrain its height;
+    ``max_width=1900`` on the Modal object continues to provide the wide layout.
     """
     st.markdown(
         f"""
 <style>
-/* streamlit-modal positions its card independently of the overlay.  Center
-   the actual card explicitly against the browser viewport; centering only the
-   overlay is not sufficient because the library applies its own top/left and
-   transform rules to the first child. */
-div[data-modal-container='true'][key='{modal_key}'],
-div[data-modal-container='true'] {{
-    position: fixed !important;
-    inset: 0 !important;
-    width: 100vw !important;
-    height: 100vh !important;
-    min-height: 100vh !important;
-    display: grid !important;
-    place-items: center !important;
-    overflow: hidden !important;
-}}
-div[data-modal-container='true'][key='{modal_key}'] > div:first-child,
-div[data-modal-container='true'] > div:first-child {{
-    position: absolute !important;
+/* IMPORTANT: target only the requested Create/Edit modal container.  Do not
+   restyle the generic modal backdrop or its anonymous children. */
+div[data-modal-container='true'][key='{modal_key}'] {{
     top: 50% !important;
-    left: 50% !important;
-    right: auto !important;
     bottom: auto !important;
-    transform: translate(-50%, -50%) !important;
+    transform: translateY(-50%) !important;
     width: 96vw !important;
     max-width: 1900px !important;
     max-height: 90vh !important;
-    margin: 0 !important;
-    align-self: center !important;
-    justify-self: center !important;
-}}
-div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child,
-div[data-modal-container='true'] > div:first-child > div:first-child {{
-    margin-top: 0 !important;
-    margin-bottom: 0 !important;
-    max-height: 90vh !important;
-}}
-div[data-modal-container='true'][key='{modal_key}'] > div:first-child > div:first-child > div:first-child,
-div[data-modal-container='true'] > div:first-child > div:first-child > div:first-child {{
-    max-height: 88vh !important;
     overflow-y: auto !important;
     overflow-x: hidden !important;
+    pointer-events: auto !important;
 }}
 </style>
 """,

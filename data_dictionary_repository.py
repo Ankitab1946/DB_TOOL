@@ -299,13 +299,70 @@ class DataDictionaryRepository:
         return str(value)
 
     def list_portfolios(self, include_inactive: bool = False) -> list[dict[str, Any]]:
+        """Return portfolio values without assuming optional audit columns exist.
+
+        SQL Server continues to use the managed ORM table.  PostgreSQL may point
+        at an established ``prj_dbd.prj_portfolio_reference`` table that predates
+        this application and therefore can legitimately contain only the core
+        portfolio columns.  Reflect the physical PostgreSQL table and select the
+        columns that actually exist so valid rows are not hidden by an ORM SELECT
+        that references missing audit fields.
+        """
+        bind = self.db.get_bind()
+        result: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        if bind.dialect.name == "postgresql":
+            inspector = inspect(bind)
+            schema, table_name = "prj_dbd", "prj_portfolio_reference"
+            if not inspector.has_table(table_name, schema=schema):
+                raise RuntimeError(f"Required PostgreSQL portfolio table {schema}.{table_name} does not exist.")
+            table = Table(table_name, MetaData(), schema=schema, autoload_with=bind)
+            required = ("port_ref_id", "portfolio_name", "sector_name")
+            missing = [name for name in required if name not in table.c]
+            if missing:
+                raise RuntimeError(
+                    f"PostgreSQL portfolio table {schema}.{table_name} is missing required column(s): "
+                    + ", ".join(missing)
+                )
+
+            optional = ("sub_sector", "remark", "is_active", "created_at", "updated_at", "created_by", "updated_by")
+            columns = [table.c[name] for name in required]
+            columns.extend(table.c[name] for name in optional if name in table.c)
+            stmt = select(*columns)
+            if not include_inactive and "is_active" in table.c:
+                # Legacy rows with NULL is_active are treated as active; older
+                # reference tables often gained this column after data existed.
+                stmt = stmt.where(or_(table.c.is_active.is_(None), table.c.is_active == true()))
+            stmt = stmt.order_by(table.c.portfolio_name, table.c.sector_name, table.c.port_ref_id)
+            rows = self.db.execute(stmt).all()
+            for item in rows:
+                mapping = dict(item._mapping)
+                row = {
+                    "port_ref_id": mapping.get("port_ref_id"),
+                    "portfolio_name": mapping.get("portfolio_name"),
+                    "sector_name": mapping.get("sector_name"),
+                    "sub_sector": mapping.get("sub_sector"),
+                    "remark": mapping.get("remark"),
+                    "is_active": True if mapping.get("is_active") is None else bool(mapping.get("is_active")),
+                    "created_at": mapping.get("created_at"),
+                    "updated_at": mapping.get("updated_at"),
+                    "created_by": mapping.get("created_by"),
+                    "updated_by": mapping.get("updated_by"),
+                }
+                pair = (str(row["portfolio_name"] or "").strip().lower(), str(row["sector_name"] or "").strip().lower())
+                if not all(pair) or pair in seen:
+                    continue
+                seen.add(pair)
+                row["label"] = portfolio_label(row["portfolio_name"], row["sector_name"])
+                result.append(row)
+            return result
+
         portfolio_model = self.portfolio_model()
         stmt = select(portfolio_model)
         if not include_inactive:
             stmt = stmt.where(portfolio_model.is_active == true())
         stmt = stmt.order_by(portfolio_model.portfolio_name, portfolio_model.sector_name, portfolio_model.port_ref_id)
-        result: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
         for item in self.db.scalars(stmt).all():
             row = model_dict(item)
             pair = (str(row["portfolio_name"]).strip().lower(), str(row["sector_name"]).strip().lower())

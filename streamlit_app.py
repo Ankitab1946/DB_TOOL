@@ -58,6 +58,13 @@ st.markdown(
     max-width: min(96vw, 1600px) !important;
     max-height: 90vh !important;
     margin: auto !important;
+    overflow-x: hidden !important;
+    box-sizing: border-box !important;
+}
+[data-testid="stDialog"] [data-testid="stExpander"],
+[data-testid="stDialog"] [data-testid="stVerticalBlock"] {
+    max-width: 100% !important;
+    box-sizing: border-box !important;
 }
 </style>
 """,
@@ -373,6 +380,15 @@ if st.session_state.get("lookup_cache_key") != lookup_key or st.session_state.ge
     }
     st.session_state["lookup_cache_key"] = lookup_key
 lookups = st.session_state.get("lookup_cache") or {"portfolios": [], "sources": [], "sections": [], "subsections": []}
+# Portfolio retrieval is intentionally independent from the combined /lookups
+# response. A failure while loading sections/subsections/sources must not make a
+# populated PostgreSQL prj_dbd.prj_portfolio_reference table appear empty.
+if not lookups.get("portfolios"):
+    direct_portfolios = api("GET", "/lookups/portfolios", quiet=True)
+    if direct_portfolios:
+        lookups = dict(lookups)
+        lookups["portfolios"] = direct_portfolios
+        st.session_state["lookup_cache"] = lookups
 portfolio_labels = list(dict.fromkeys(
     item.get("label") for item in lookups.get("portfolios", []) if item.get("label")
 ))
@@ -583,8 +599,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
 
             for pair_index, (pair_section, pair_subsection) in enumerate(form_pairs):
                 st.markdown(f"**{pair_section} / {pair_subsection}**")
-                calc_col, report_col, order_col = st.columns([2.4, 1.1, 0.8])
-                pair_calc = calc_col.text_area(
+                pair_calc = st.text_area(
                     "Calculation Logic",
                     value=str(calculation_defaults[pair_index] or "NA"),
                     disabled=locked,
@@ -594,7 +609,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
                 )
                 calculation_entries.append(pair_calc)
                 report_type_entries.append(
-                    report_col.text_input(
+                    st.text_input(
                         "Report Type",
                         value=str(report_type_defaults[pair_index] or "NA"),
                         disabled=locked,
@@ -603,7 +618,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
                     )
                 )
                 display_order_entries.append(
-                    int(order_col.number_input(
+                    int(st.number_input(
                         "Display Order *",
                         min_value=0,
                         value=int(display_order_defaults[pair_index]),
@@ -613,9 +628,8 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
                     ))
                 )
 
-                detail_left, detail_right = st.columns(2)
                 definition_entries.append(
-                    detail_left.text_area(
+                    st.text_area(
                         "Attribute Definition",
                         value=str(definition_defaults[pair_index] or ""),
                         disabled=locked,
@@ -624,7 +638,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
                     )
                 )
                 description_entries.append(
-                    detail_right.text_area(
+                    st.text_area(
                         "Attribute Description",
                         value=str(description_defaults[pair_index] or ""),
                         disabled=locked,
@@ -646,9 +660,8 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
                     st.session_state[tech_key] = generate_tech_logic(pair_calc)
                     st.session_state[tech_calc_key] = pair_calc
 
-                tech_left, tech_right = st.columns(2)
                 tech_entries.append(
-                    tech_left.text_area(
+                    st.text_area(
                         "Tech Logic",
                         disabled=locked,
                         height=100,
@@ -657,7 +670,7 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
                     )
                 )
                 examples_entries.append(
-                    tech_right.text_area(
+                    st.text_area(
                         "Examples (Prompt Management)",
                         value=str(examples_defaults[pair_index] or ""),
                         disabled=locked,
@@ -699,15 +712,14 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
                 key=f"{prefix}_report_type",
                 help="Report Type is part of the unique Scope key.",
             )
-            detail_left, detail_right = st.columns(2)
-            attribute_definition = detail_left.text_area(
+            attribute_definition = st.text_area(
                 "Attribute Definition",
                 value=str(definition_source),
                 disabled=locked,
                 height=125,
                 key=f"{prefix}_definition",
             )
-            attribute_description = detail_right.text_area(
+            attribute_description = st.text_area(
                 "Attribute Description",
                 value=str(description_source),
                 disabled=locked,
@@ -728,27 +740,25 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
                 st.session_state[tech_key] = generate_tech_logic(calculation_logic)
                 st.session_state[tech_calc_key] = calculation_logic
 
-            tech_left, tech_right = st.columns(2)
-            tech_logic = tech_left.text_area(
+            tech_logic = st.text_area(
                 "Tech Logic",
                 disabled=locked,
                 height=125,
                 key=tech_key,
                 help="Auto-populated from Calculation Logic and editable before saving.",
             )
-            examples = tech_right.text_area(
+            examples = st.text_area(
                 "Examples (Prompt Management)",
                 value=str(examples_source),
                 disabled=locked,
                 height=100,
                 key=f"{prefix}_examples",
             )
-            c1, c2 = st.columns(2)
-            display_order = int(c1.number_input(
+            display_order = int(st.number_input(
                 "Display Order *", min_value=0, value=int(display_order_source or 0), step=1,
                 disabled=locked, key=f"{prefix}_order"
             ))
-            display_name = c2.text_input(
+            display_name = st.text_input(
                 "Display Name", value=str(display_name_source), disabled=locked, key=f"{prefix}_display"
             )
 

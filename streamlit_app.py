@@ -16,25 +16,6 @@ from DataDictionaryAdminApp.service.excel_service import STANDARD_FIELDS
 from DataDictionaryAdminApp.utils.normalizers import align_int_pipe_values, align_pipe_values, canonical_portfolio_label, generate_physical_name, generate_tech_logic, pair_pipe_values, portfolio_from_sheet_name
 
 
-class StateAwareModal(Modal):
-    """Modal that synchronizes the application-level open flag on every close.
-
-    ``streamlit-modal`` keeps its own ``<key>-opened`` flag.  Create/Edit also
-    have application flags (``show_create``/``show_edit``).  If the built-in
-    X only closes the library flag while the application flag stays True, the
-    next rerun can reopen the modal.  Keeping both flags synchronized makes X
-    dismissal immediate and prevents the modal from being reconstructed.
-    """
-
-    def __init__(self, title: str, key: str, *, state_flag: str, padding: int = 20, max_width: int = 744):
-        super().__init__(title, key=key, padding=padding, max_width=max_width)
-        self.state_flag = state_flag
-
-    def close(self, rerun_condition: bool = True):
-        st.session_state[self.state_flag] = False
-        return super().close(rerun_condition=rerun_condition)
-
-
 def load_env() -> None:
     candidates = [Path.cwd() / ".env", *[parent / ".env" for parent in Path(__file__).resolve().parents]]
     for path in candidates:
@@ -69,8 +50,15 @@ st.markdown(
 .stTabs [aria-selected="true"] { background:#dceafa !important; border-color:#86a7c8 !important; }
 [data-testid="stDataFrame"], [data-testid="stDataEditor"] { border:1px solid #c6d6e5; border-radius:6px; overflow:hidden; }
 .small-note { color:#5b6f84; font-size:.84rem; }
-/* Create/Edit modal sizing is injected inside the modal container itself so
-   it is rendered after streamlit-modal's own stylesheet and wins reliably. */
+/* Create/Edit use Streamlit's native dialog. The overlay owns viewport centering;
+   only widen the dialog responsively without overriding its position/backdrop. */
+[data-testid="stDialog"] [role="dialog"],
+.stDialog [role="dialog"] {
+    width: min(96vw, 1600px) !important;
+    max-width: min(96vw, 1600px) !important;
+    max-height: 90vh !important;
+    margin: auto !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -261,8 +249,6 @@ for key, default in {
     "soft_deleted_cache_key": "",
     "soft_deleted_cache": None,
     "latest_excel": None,
-    "show_create": False,
-    "show_edit": False,
     "edit_unlocked": False,
     "show_finalize_confirm": False,
     "show_soft_deleted": False,
@@ -400,54 +386,8 @@ source_by_code = {item.get("source_code"): item.get("source_name") for item in l
 def source_label(code: str) -> str:
     return f"{code}[{source_by_code.get(code, code)}]"
 
-create_modal = StateAwareModal(
-    "Create New Attribute",
-    key="create_attribute_modal",
-    state_flag="show_create",
-    max_width=1900,
-)
-edit_modal = StateAwareModal(
-    "Edit Attribute",
-    key="edit_attribute_modal",
-    state_flag="show_edit",
-    max_width=1900,
-)
 finalize_modal = Modal("Finalize and Upload", key="finalize_modal", max_width=720)
 cleanup_modal = Modal("Cleanup Database", key="cleanup_database_modal", max_width=980)
-
-
-def render_attribute_modal_style(modal_key: str) -> None:
-    """Center Create/Edit without changing the modal library's overlay/card hierarchy.
-
-    The previous override forced the modal wrapper and its first child into a
-    custom fixed/grid layout.  On some Streamlit/browser combinations that
-    placed the grey backdrop above the actual form, so the page appeared
-    disabled and none of the Create/Edit controls could be clicked.
-
-    ``streamlit-modal`` already owns backdrop, z-index, width and interaction.
-    Only vertically center the keyed modal container and constrain its height;
-    ``max_width=1900`` on the Modal object continues to provide the wide layout.
-    """
-    st.markdown(
-        f"""
-<style>
-/* IMPORTANT: target only the requested Create/Edit modal container.  Do not
-   restyle the generic modal backdrop or its anonymous children. */
-div[data-modal-container='true'][key='{modal_key}'] {{
-    top: 50% !important;
-    bottom: auto !important;
-    transform: translateY(-50%) !important;
-    width: 96vw !important;
-    max-width: 1900px !important;
-    max-height: 90vh !important;
-    overflow-y: auto !important;
-    overflow-x: hidden !important;
-    pointer-events: auto !important;
-}}
-</style>
-""",
-        unsafe_allow_html=True,
-    )
 
 
 def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bool = False) -> dict[str, Any] | None:
@@ -534,7 +474,12 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     if portfolio_default and portfolio_default not in p_options:
         p_options.insert(0, portfolio_default)
     if not p_options:
-        c1.error("No portfolio values returned from dbo.prj_portfolio_reference_new_test.")
+        portfolio_table = (
+            "prj_dbd.prj_portfolio_reference"
+            if st.session_state.get("database_type") == "POSTGRES"
+            else "dbo.prj_portfolio_reference_new_test"
+        )
+        c1.error(f"No portfolio values returned from {portfolio_table}.")
         p_options = [""]
     p_index = p_options.index(portfolio_default) if portfolio_default in p_options else 0
     portfolio = c1.selectbox("Portfolio / Scope *", p_options, index=p_index, disabled=locked, key=f"{prefix}_portfolio")
@@ -861,12 +806,57 @@ def attribute_form(prefix: str, detail: dict[str, Any] | None = None, locked: bo
     }
 
 
+def _clear_create_dialog_state() -> None:
+    for key in ("create_next_prj_id", "create_prj", "create_physical_suggestion"):
+        st.session_state.pop(key, None)
+
+
+@st.dialog("Create New Attribute", width="large")
+def create_attribute_dialog() -> None:
+    """Native viewport-centered Create dialog; X dismisses client-side immediately."""
+    payload = attribute_form("create")
+    if payload:
+        result = api("POST", "/data-dictionary/attributes", json=payload)
+        if result:
+            staged_tables = ", ".join(result.get("staged_tables", []))
+            generated_id = result.get("cfv_id") or result.get("prj_id")
+            st.session_state["flash_message"] = (
+                f"CFV ID generated: {generated_id}. Attribute staged successfully. "
+                f"Physical name: {result.get('prj_physical_attribute_name')}. "
+                f"Saved to: {staged_tables}"
+            )
+            st.session_state["audit_cache_rows"] = None
+            st.session_state["prompts_cache"] = None
+            _clear_create_dialog_state()
+            st.rerun()
+    if st.button("Close", key="create_close", width="stretch"):
+        _clear_create_dialog_state()
+        st.rerun()
+
+
+@st.dialog("Edit Attribute", width="large")
+def edit_attribute_dialog(selected_prj: str, detail: dict[str, Any]) -> None:
+    """Native viewport-centered Edit dialog with immediate built-in X dismissal."""
+    payload = attribute_form("edit", detail, locked=False)
+    if payload:
+        result = api("PUT", f"/data-dictionary/attributes/{selected_prj}", json=payload)
+        if result:
+            st.session_state["flash_message"] = (
+                f"{selected_prj} changes staged successfully. Review the delta before finalization."
+            )
+            st.session_state["audit_cache_rows"] = None
+            st.session_state["prompts_cache"] = None
+            st.session_state["edit_unlocked"] = False
+            st.session_state["edit_detail"] = None
+            st.rerun()
+    if st.button("Close", key="edit_close", width="stretch"):
+        st.session_state["edit_unlocked"] = False
+        st.session_state["edit_detail"] = None
+        st.rerun()
+
+
 is_admin = bool(refreshed.get("is_admin"))
-modal_active = bool(
-    st.session_state.get("show_create")
-    or st.session_state.get("show_edit")
-    or st.session_state.get("show_cleanup")
-)
+modal_active = bool(st.session_state.get("show_cleanup"))
 main_tab_labels = ["Data Dictionary", "Prompt Management", "Audit"] + (["Admin Tools"] if is_admin else [])
 main_tabs = st.tabs(main_tab_labels)
 
@@ -991,8 +981,7 @@ with main_tabs[0]:
             next_id = api("GET", "/lookups/next-prj-id")
             if next_id and next_id.get("prj_id"):
                 st.session_state["create_next_prj_id"] = next_id
-                st.session_state["show_create"] = True
-                create_modal.open()
+                create_attribute_dialog()
         if deleted_col.button(
             "Hide Soft Deleted Records" if st.session_state.get("show_soft_deleted") else "View Soft Deleted Records",
             width="stretch",
@@ -1153,9 +1142,8 @@ with main_tabs[0]:
                             if str(rule_row.get("scope_id")) == str(selected_scope_id):
                                 st.session_state["edit_rule"] = index
                                 break
-                    st.session_state["show_edit"] = True
                     st.session_state["edit_unlocked"] = True
-                    edit_modal.open()
+                    edit_attribute_dialog(selected_prj, detail)
             if action2.button("Soft Delete", disabled=not selected_prj, width="stretch"):
                 response = api("DELETE", f"/data-dictionary/attributes/{selected_prj}")
                 if response:
@@ -1533,55 +1521,6 @@ if is_admin:
             st.caption("Run sql/postgres/001_create_tables.sql, then sql/postgres/002_validate_schema.sql before enabling PostgreSQL writes.")
         else:
             st.caption("Run sql/001_create_tables.sql, then sql/002_validate_schema.sql before enabling SQL Server writes.")
-
-if st.session_state.get("show_create") and create_modal.is_open():
-    with create_modal.container():
-        render_attribute_modal_style("create_attribute_modal")
-        payload = attribute_form("create")
-        if payload:
-            result = api("POST", "/data-dictionary/attributes", json=payload)
-            if result:
-                staged_tables = ", ".join(result.get("staged_tables", []))
-                generated_id = result.get("cfv_id") or result.get("prj_id")
-                st.session_state["flash_message"] = (
-                    f"CFV ID generated: {generated_id}. Attribute staged successfully. "
-                    f"Physical name: {result.get('prj_physical_attribute_name')}. "
-                    f"Saved to: {staged_tables}"
-                )
-                st.session_state["audit_cache_rows"] = None
-                st.session_state["prompts_cache"] = None
-                st.session_state.pop("create_next_prj_id", None)
-                st.session_state.pop("create_prj", None)
-                st.session_state.pop("create_physical_suggestion", None)
-                create_modal.close()
-        if st.button("Close", key="create_close"):
-            st.session_state.pop("create_next_prj_id", None)
-            st.session_state.pop("create_prj", None)
-            st.session_state.pop("create_physical_suggestion", None)
-            create_modal.close()
-
-if st.session_state.get("show_edit") and edit_modal.is_open():
-    selected_prj = st.session_state.get("selected_prj")
-    detail = st.session_state.get("edit_detail")
-    with edit_modal.container():
-        render_attribute_modal_style("edit_attribute_modal")
-        if detail:
-            payload = attribute_form("edit", detail, locked=False)
-            if payload:
-                result = api("PUT", f"/data-dictionary/attributes/{selected_prj}", json=payload)
-                if result:
-                    st.session_state["flash_message"] = (
-                        f"{selected_prj} changes staged successfully. Review the delta before finalization."
-                    )
-                    st.session_state["audit_cache_rows"] = None
-                    st.session_state["prompts_cache"] = None
-                    st.session_state["edit_unlocked"] = False
-                    st.session_state["edit_detail"] = None
-                    edit_modal.close()
-        if st.button("Close", key="edit_close"):
-            st.session_state["edit_unlocked"] = False
-            st.session_state["edit_detail"] = None
-            edit_modal.close()
 
 if st.session_state.get("show_cleanup"):
     if not cleanup_modal.is_open():

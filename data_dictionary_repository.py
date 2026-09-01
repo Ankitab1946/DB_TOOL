@@ -19,6 +19,7 @@ from DataDictionaryAdminApp.model.entities import (
     AttributeMaster,
     AuditTable,
     PortfolioReference,
+    PostgresPortfolioReference,
     RawAttribute,
     StagingAttributeDisplay,
     StagingAttributeMaster,
@@ -103,6 +104,16 @@ class DataDictionaryRepository:
         return ({"dbo": "prj_dbd", "stg": "prj_stage"}.get(logical, logical)
                 if bind.dialect.name == "postgresql" else logical)
 
+    def portfolio_model(self):
+        """Return the physical portfolio-reference ORM model for this engine."""
+        bind = self.db.get_bind()
+        return PostgresPortfolioReference if bind.dialect.name == "postgresql" else PortfolioReference
+
+    def portfolio_table_name(self) -> str:
+        return ("prj_dbd.prj_portfolio_reference"
+                if self.db.get_bind().dialect.name == "postgresql"
+                else "dbo.prj_portfolio_reference_new_test")
+
     def hard_delete_dictionary_data(self) -> dict[str, int]:
         deleted: dict[str, int] = {}
         targets = (
@@ -120,10 +131,11 @@ class DataDictionaryRepository:
             self.db.execute(delete(model))
             deleted[table_name] = count
 
-        custom_filter = ~PortfolioReference.port_ref_id.in_([1, 2, 3, 4])
-        count = int(self.db.scalar(select(func.count()).select_from(PortfolioReference).where(custom_filter)) or 0)
-        self.db.execute(delete(PortfolioReference).where(custom_filter))
-        deleted["dbo.prj_portfolio_reference_new_test (custom rows)"] = count
+        portfolio_model = self.portfolio_model()
+        custom_filter = ~portfolio_model.port_ref_id.in_([1, 2, 3, 4])
+        count = int(self.db.scalar(select(func.count()).select_from(portfolio_model).where(custom_filter)) or 0)
+        self.db.execute(delete(portfolio_model).where(custom_filter))
+        deleted[f"{self.portfolio_table_name()} (custom rows)"] = count
         return deleted
 
     def audit(self, schema_name: str, table_name: str, record_key: str, action: str, before: Any,
@@ -287,10 +299,11 @@ class DataDictionaryRepository:
         return str(value)
 
     def list_portfolios(self, include_inactive: bool = False) -> list[dict[str, Any]]:
-        stmt = select(PortfolioReference)
+        portfolio_model = self.portfolio_model()
+        stmt = select(portfolio_model)
         if not include_inactive:
-            stmt = stmt.where(PortfolioReference.is_active == true())
-        stmt = stmt.order_by(PortfolioReference.portfolio_name, PortfolioReference.sector_name, PortfolioReference.port_ref_id)
+            stmt = stmt.where(portfolio_model.is_active == true())
+        stmt = stmt.order_by(portfolio_model.portfolio_name, portfolio_model.sector_name, portfolio_model.port_ref_id)
         result: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         for item in self.db.scalars(stmt).all():
@@ -331,10 +344,11 @@ class DataDictionaryRepository:
 
     def get_rules(self, prj_id: str, schema: str = "dbo") -> list[dict[str, Any]]:
         rule_model, display_model, master_model = self._rule_model(schema), self._display_model(schema), self._master_model(schema)
+        portfolio_model = self.portfolio_model()
         stmt = (
-            select(rule_model, display_model, PortfolioReference, master_model.is_active)
+            select(rule_model, display_model, portfolio_model, master_model.is_active)
             .join(display_model, display_model.scope_id == rule_model.scope_id)
-            .join(PortfolioReference, PortfolioReference.port_ref_id == rule_model.port_ref_id)
+            .join(portfolio_model, portfolio_model.port_ref_id == rule_model.port_ref_id)
             .join(master_model, master_model.prj_id == rule_model.prj_id)
             .where(rule_model.prj_id == prj_id)
             .order_by(rule_model.port_ref_id, display_model.display_order, rule_model.scope_id)
@@ -421,7 +435,7 @@ class DataDictionaryRepository:
         return or_(lowered == wanted, lowered.like(f"{wanted}|%"), lowered.like(f"%|{wanted}|%"), lowered.like(f"%|{wanted}"))
 
     def filter_final(self, filters: Any, page_size: int) -> dict[str, Any]:
-        m, r, d, p = AttributeMaster, AttributeBusinessRule, AttributeDisplay, PortfolioReference
+        m, r, d, p = AttributeMaster, AttributeBusinessRule, AttributeDisplay, self.portfolio_model()
         conditions: list[Any] = []
         if not filters.include_deleted: conditions.append(m.is_active == true())
         if filters.prj_id: conditions.append(m.prj_id.ilike(f"%{filters.prj_id.strip()}%"))
@@ -473,9 +487,10 @@ class DataDictionaryRepository:
         if not masters: return []
         prj_ids = [x.prj_id for x in masters]
         by_prj: dict[str, list[tuple[Any, Any, Any]]] = {x: [] for x in prj_ids}
-        stmt = (select(AttributeBusinessRule, AttributeDisplay, PortfolioReference)
+        portfolio_model = self.portfolio_model()
+        stmt = (select(AttributeBusinessRule, AttributeDisplay, portfolio_model)
                 .join(AttributeDisplay, AttributeDisplay.scope_id == AttributeBusinessRule.scope_id)
-                .join(PortfolioReference, PortfolioReference.port_ref_id == AttributeBusinessRule.port_ref_id)
+                .join(portfolio_model, portfolio_model.port_ref_id == AttributeBusinessRule.port_ref_id)
                 .where(AttributeBusinessRule.prj_id.in_(prj_ids))
                 .order_by(AttributeBusinessRule.prj_id, AttributeBusinessRule.port_ref_id, AttributeDisplay.display_order))
         for rule, display, portfolio in self.db.execute(stmt).all(): by_prj.setdefault(rule.prj_id, []).append((rule, display, portfolio))
@@ -492,10 +507,11 @@ class DataDictionaryRepository:
         return {str(v) for v in self.db.scalars(select(AttributeMaster.prj_id).where(AttributeMaster.is_active == true())).all() if v is not None}
 
     def editable_rows(self, include_deleted: bool = True) -> list[dict[str, Any]]:
-        stmt=(select(AttributeMaster,AttributeBusinessRule,AttributeDisplay,PortfolioReference)
+        portfolio_model = self.portfolio_model()
+        stmt=(select(AttributeMaster,AttributeBusinessRule,AttributeDisplay,portfolio_model)
               .join(AttributeBusinessRule,AttributeBusinessRule.prj_id==AttributeMaster.prj_id)
               .join(AttributeDisplay,AttributeDisplay.scope_id==AttributeBusinessRule.scope_id)
-              .join(PortfolioReference,PortfolioReference.port_ref_id==AttributeBusinessRule.port_ref_id))
+              .join(portfolio_model,portfolio_model.port_ref_id==AttributeBusinessRule.port_ref_id))
         if not include_deleted: stmt=stmt.where(AttributeMaster.is_active==true())
         stmt=stmt.order_by(AttributeMaster.prj_id,AttributeBusinessRule.port_ref_id,AttributeDisplay.display_order)
         rows=[]

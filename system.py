@@ -88,7 +88,9 @@ def cleanup_database(payload: CleanupRequest, request: Request, db: Session = De
         "deleted_total": sum(deleted_by_table.values()),
         "deleted_by_table": deleted_by_table,
         "preserved_tables": [
-            "dbo.prj_portfolio_reference_new_test (required seed rows port_ref_id 1-4)",
-            "dbo.prj_data_sources (read-only external reference)",
+            ("prj_dbd.prj_portfolio_reference" if db.get_bind().dialect.name == "postgresql"
+             else "dbo.prj_portfolio_reference_new_test") + " (required seed rows port_ref_id 1-4)",
+            ("prj_dbd.prj_data_sources" if db.get_bind().dialect.name == "postgresql"
+             else "dbo.prj_data_sources") + " (read-only external reference)",
         ],
     }

@@ -246,7 +246,12 @@ class DataDictionaryRepository:
             return self._source_table_cache[cache_key]
         inspector = inspect(bind)
         table: Table | None = None
-        for name in ("prj_data_sources", "prj_data_source"):
+
+        # PostgreSQL has one authoritative source-reference table.  Do not fall
+        # back to the SQL Server/legacy singular name because the UI contract is
+        # explicitly prj_dbd.prj_data_sources.
+        names = ("prj_data_sources",) if bind.dialect.name == "postgresql" else ("prj_data_sources", "prj_data_source")
+        for name in names:
             if inspector.has_table(name, schema=schema):
                 table = Table(name, MetaData(), schema=schema, autoload_with=bind)
                 break
@@ -259,21 +264,36 @@ class DataDictionaryRepository:
 
     def list_sources(self) -> list[dict[str, Any]]:
         table = self._source_table()
+        is_postgres = self.db.get_bind().dialect.name == "postgresql"
         if table is None:
+            if is_postgres:
+                raise RuntimeError("Required PostgreSQL source table prj_dbd.prj_data_sources does not exist.")
             return [{"src_id": None, "source_code": "SNPAR", "source_name": "SNPAR (default)"}]
-        id_col = next((table.c[name] for name in ("src_id", "prj_src_id") if name in table.c), None)
+
+        id_col = next((table.c[name] for name in ("src_id", "prj_src_id", "source_id") if name in table.c), None)
         if "source_code" not in table.c or "source_name" not in table.c:
+            if is_postgres:
+                missing = [name for name in ("source_code", "source_name") if name not in table.c]
+                raise RuntimeError(
+                    "PostgreSQL source table prj_dbd.prj_data_sources is missing required column(s): "
+                    + ", ".join(missing)
+                )
             return [{"src_id": None, "source_code": "SNPAR", "source_name": "SNPAR (default)"}]
+
         columns = [table.c.source_code, table.c.source_name]
         if id_col is not None:
             columns.insert(0, id_col)
         result = []
-        for row in self.db.execute(select(*columns).order_by(table.c.source_name)).all():
+        for row in self.db.execute(select(*columns).order_by(table.c.source_name, table.c.source_code)).all():
             mapping = row._mapping
+            code = mapping.get("source_code")
+            name = mapping.get("source_name")
+            if code is None or not str(code).strip():
+                continue
             result.append({
                 "src_id": mapping.get(id_col.key) if id_col is not None else None,
-                "source_code": mapping["source_code"],
-                "source_name": mapping["source_name"],
+                "source_code": str(code).strip(),
+                "source_name": str(name).strip() if name is not None and str(name).strip() else str(code).strip(),
             })
         return result
 
@@ -329,12 +349,10 @@ class DataDictionaryRepository:
             optional = ("sub_sector", "remark", "is_active", "created_at", "updated_at", "created_by", "updated_by")
             columns = [table.c[name] for name in required]
             columns.extend(table.c[name] for name in optional if name in table.c)
-            stmt = select(*columns)
-            if not include_inactive and "is_active" in table.c:
-                # Legacy rows with NULL is_active are treated as active; older
-                # reference tables often gained this column after data existed.
-                stmt = stmt.where(or_(table.c.is_active.is_(None), table.c.is_active == true()))
-            stmt = stmt.order_by(table.c.portfolio_name, table.c.sector_name, table.c.port_ref_id)
+            # PostgreSQL Portfolio/Scope is an authoritative reference lookup.
+            # Return the physical table rows regardless of legacy is_active values;
+            # users reported populated reference data being hidden by this filter.
+            stmt = select(*columns).order_by(table.c.portfolio_name, table.c.sector_name, table.c.port_ref_id)
             rows = self.db.execute(stmt).all()
             for item in rows:
                 mapping = dict(item._mapping)

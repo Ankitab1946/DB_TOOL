@@ -15,8 +15,8 @@ from DataDictionaryAdminApp.api.schemas_api import AttributeUpsert, FilterReques
 from DataDictionaryAdminApp.config import get_settings
 from DataDictionaryAdminApp.model.entities import (
     AttributeBusinessRule,
+    AttributeDisplay,
     AttributeMaster,
-    PortfolioReference,
 )
 from DataDictionaryAdminApp.repositories.data_dictionary_repository import DataDictionaryRepository, model_dict, portfolio_label
 from DataDictionaryAdminApp.utils.normalizers import (
@@ -545,6 +545,7 @@ class DataDictionaryService:
                 "dbo.raw_prj_attribute_new_test",
                 "stg.prj_attribute_master_new_test",
                 "stg.prj_attribute_business_rules_new_test",
+                "stg.prj_attribute_display_test",
             ],
         }
 
@@ -566,8 +567,9 @@ class DataDictionaryService:
                 status_code=422,
                 detail=(
                     "Could not save the attribute to raw/staging tables. "
-                    "Verify that dbo.raw_prj_attribute_new_test, stg.prj_attribute_master_new_test and "
-                    f"stg.prj_attribute_business_rules_new_test exist and match the supplied SQL scripts. Database error: {detail}"
+                    "Verify that dbo.raw_prj_attribute_new_test, stg.prj_attribute_master_new_test, "
+                    "stg.prj_attribute_business_rules_new_test and stg.prj_attribute_display_test exist and match "
+                    f"the supplied SQL scripts. Database error: {detail}"
                 ),
             ) from exc
         except Exception:
@@ -977,19 +979,45 @@ class DataDictionaryService:
         )
 
     @staticmethod
-    def _same_rule_key(rule: AttributeBusinessRule, staged: dict[str, Any]) -> bool:
+    def _same_rule_key(rule: AttributeBusinessRule, display: AttributeDisplay, staged: dict[str, Any]) -> bool:
         return (
             rule.source_abbr_name == staged.get("source_abbr_name")
-            and int(rule.display_order) == int(staged.get("display_order") or 0)
-            and rule.section == staged.get("section")
-            and rule.subsection == staged.get("subsection")
-            and rule.report_type == staged.get("report_type", "NA")
+            and int(display.display_order) == int(staged.get("display_order") or 0)
+            and display.section == staged.get("section")
+            and display.subsection == staged.get("subsection")
+            and display.report_type == staged.get("report_type", "NA")
         )
+
+    @staticmethod
+    def _assign_final_business(rule: AttributeBusinessRule, staged: dict[str, Any]) -> None:
+        rule.prj_id = staged.get("prj_id")
+        rule.port_ref_id = staged.get("port_ref_id")
+        rule.source_abbr_name = staged.get("source_abbr_name")
+        rule.prompt_description = staged.get("prompt_description")
+        rule.examples_for_llm = staged.get("examples")
+        rule.editable = staged.get("editable")
+        rule.data_type = staged.get("symbol")
+        rule.attribute_type = staged.get("mapping_type")
+        rule.business_logic = staged.get("tech_logic")
+        rule.calculation_logic = staged.get("calculation_logic") or "NA"
+
+    @staticmethod
+    def _assign_final_display(display: AttributeDisplay, staged: dict[str, Any]) -> None:
+        display.display_order = int(staged.get("display_order") or 0)
+        display.prj_id = staged.get("prj_id")
+        display.display_name = staged.get("display_name")
+        display.section = staged.get("section")
+        display.subsection = staged.get("subsection")
+        display.prj_attribute_definition = staged.get("prj_attribute_definition")
+        display.prj_attribute_description = staged.get("prj_attribute_description")
+        display.segment = staged.get("segment") or "NA"
+        display.report_type = staged.get("report_type") or "NA"
 
     def _upsert_final_rule(self, staged: dict[str, Any], user: str, strict_key: bool = False) -> None:
         candidates = list(
-            self.db.scalars(
-                select(AttributeBusinessRule)
+            self.db.execute(
+                select(AttributeBusinessRule, AttributeDisplay)
+                .join(AttributeDisplay, AttributeDisplay.scope_id == AttributeBusinessRule.scope_id)
                 .where(
                     AttributeBusinessRule.prj_id == staged["prj_id"],
                     AttributeBusinessRule.port_ref_id == staged["port_ref_id"],
@@ -997,72 +1025,50 @@ class DataDictionaryService:
                 .order_by(AttributeBusinessRule.scope_id)
             ).all()
         )
-        exact = next((row for row in candidates if self._same_rule_key(row, staged)), None)
-        target = exact or (candidates[0] if len(candidates) == 1 and not strict_key else None)
+        exact = next(((rule, display) for rule, display in candidates if self._same_rule_key(rule, display, staged)), None)
+        target_pair = exact or (candidates[0] if len(candidates) == 1 and not strict_key else None)
         if len(candidates) > 1 and exact is None and not strict_key:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Cannot unambiguously update final business rule for {staged['prj_id']} / port_ref_id "
-                    f"{staged['port_ref_id']}. Multiple rules exist and the edited unique key no longer matches."
+                    f"Cannot unambiguously update final business/display scope for {staged['prj_id']} / port_ref_id "
+                    f"{staged['port_ref_id']}. Multiple scopes exist and the edited key no longer matches."
                 ),
             )
 
-        fields = (
-            "prj_id",
-            "port_ref_id",
-            "source_abbr_name",
-            "editable",
-            "symbol",
-            "mapping_type",
-            "calculation_logic",
-            "prj_attribute_definition",
-            "prj_attribute_description",
-            "segment",
-            "report_type",
-            "tech_logic",
-            "display_order",
-            "display_name",
-            "section",
-            "subsection",
-            "prompt_description",
-            "examples",
-            "is_active",
-        )
-        if target:
-            before = model_dict(target)
-            for field in fields:
-                setattr(target, field, staged.get(field))
-            target.updated_at = datetime.utcnow()
-            target.updated_by = user
+        if target_pair:
+            rule, display = target_pair
+            before_rule = model_dict(rule)
+            before_display = model_dict(display)
+            self._assign_final_business(rule, staged)
+            self._assign_final_display(display, staged)
+            now = datetime.utcnow()
+            rule.updated_at = display.updated_at = now
+            rule.updated_by = display.updated_by = user
             self.repo.audit(
-                "dbo",
-                "prj_attribute_business_rules_new_test",
-                str(target.scope_id),
-                "UPDATE",
-                before,
-                model_dict(target),
-                user,
-                "FINALIZE",
+                "dbo", "prj_attribute_business_rules_new_test", str(rule.scope_id), "UPDATE",
+                before_rule, model_dict(rule), user, "FINALIZE",
+            )
+            self.repo.audit(
+                "dbo", "prj_attribute_display_test", str(display.display_id), "UPDATE",
+                before_display, model_dict(display), user, "FINALIZE",
             )
             return
 
-        target = AttributeBusinessRule(
-            **{field: staged.get(field) for field in fields},
-            created_by=user,
-            updated_by=user,
-        )
-        self.db.add(target)
+        rule = AttributeBusinessRule(created_by=user, updated_by=user)
+        self._assign_final_business(rule, staged)
+        display = AttributeDisplay(created_by=user, updated_by=user)
+        self._assign_final_display(display, staged)
+        rule.display = display
+        self.db.add(rule)
         self.db.flush()
         self.repo.audit(
-            "dbo",
-            "prj_attribute_business_rules_new_test",
-            str(target.scope_id),
-            "INSERT",
-            None,
-            model_dict(target),
-            user,
-            "FINALIZE",
+            "dbo", "prj_attribute_business_rules_new_test", str(rule.scope_id), "INSERT",
+            None, model_dict(rule), user, "FINALIZE",
+        )
+        self.repo.audit(
+            "dbo", "prj_attribute_display_test", str(display.display_id), "INSERT",
+            None, model_dict(display), user, "FINALIZE",
         )
 
     def finalize(self, user: str, confirm: bool) -> dict[str, Any]:
@@ -1079,28 +1085,10 @@ class DataDictionaryService:
                 if not staged_master:
                     continue
                 self._upsert_final_master(staged_master, user)
-                if not staged_master["is_active"]:
-                    existing_rules = list(
-                        self.db.scalars(
-                            select(AttributeBusinessRule).where(AttributeBusinessRule.prj_id == prj_id)
-                        ).all()
-                    )
-                    for rule in existing_rules:
-                        before = model_dict(rule)
-                        rule.is_active = False
-                        rule.updated_at = datetime.utcnow()
-                        rule.updated_by = user
-                        self.repo.audit(
-                            "dbo",
-                            "prj_attribute_business_rules_new_test",
-                            str(rule.scope_id),
-                            "SOFT_DELETE",
-                            before,
-                            model_dict(rule),
-                            user,
-                            "FINALIZE",
-                        )
-                else:
+                # Soft delete/reactivate state is maintained at master level. Business
+                # and display scope rows remain intact and become visible again on
+                # reactivation, preserving their scope_id/display_id relationships.
+                if staged_master["is_active"]:
                     staged_rules = self.repo.get_rules(prj_id, "stg")
                     seen_ports: dict[int, int] = {}
                     for staged_rule in staged_rules:
@@ -1119,34 +1107,38 @@ class DataDictionaryService:
         return {"updated": len(prj_ids), "delta": delta, "message": "Database tables updated successfully."}
 
     def prompt_rows(self, include_deleted: bool = True) -> list[dict[str, Any]]:
+        portfolio_model = self.repo.portfolio_model()
         stmt = (
-            select(AttributeBusinessRule, PortfolioReference)
-            .join(PortfolioReference, PortfolioReference.port_ref_id == AttributeBusinessRule.port_ref_id)
+            select(AttributeBusinessRule, AttributeDisplay, AttributeMaster, portfolio_model)
+            .join(AttributeDisplay, AttributeDisplay.scope_id == AttributeBusinessRule.scope_id)
+            .join(AttributeMaster, AttributeMaster.prj_id == AttributeBusinessRule.prj_id)
+            .join(portfolio_model, portfolio_model.port_ref_id == AttributeBusinessRule.port_ref_id)
             .order_by(
                 AttributeBusinessRule.prj_id,
                 AttributeBusinessRule.port_ref_id,
-                AttributeBusinessRule.display_order,
+                AttributeDisplay.display_order,
                 AttributeBusinessRule.scope_id,
             )
         )
         if not include_deleted:
-            stmt = stmt.where(AttributeBusinessRule.is_active == true())
+            stmt = stmt.where(AttributeMaster.is_active == true())
         rows: list[dict[str, Any]] = []
-        for rule, portfolio in self.db.execute(stmt).all():
+        for rule, display, master, portfolio in self.db.execute(stmt).all():
             rows.append(
                 {
                     "scope_id": rule.scope_id,
+                    "display_id": display.display_id,
                     "prj_id": rule.prj_id,
                     "port_ref_id": rule.port_ref_id,
                     "portfolio": portfolio_label(portfolio.portfolio_name, portfolio.sector_name),
                     "source_abbr_name": rule.source_abbr_name,
-                    "section": rule.section,
-                    "subsection": rule.subsection,
-                    "report_type": rule.report_type,
-                    "display_name": rule.display_name,
+                    "section": display.section,
+                    "subsection": display.subsection,
+                    "report_type": display.report_type,
+                    "display_name": display.display_name,
                     "prompt_description": rule.prompt_description,
-                    "examples": rule.examples,
-                    "is_active": bool(rule.is_active),
+                    "examples": rule.examples_for_llm,
+                    "is_active": bool(master.is_active),
                 }
             )
         return rows
@@ -1164,12 +1156,15 @@ class DataDictionaryService:
         master = self.db.get(AttributeMaster, rule.prj_id)
         if not master:
             raise HTTPException(status_code=409, detail=f"Master record {rule.prj_id} is missing.")
-
-        staged = model_dict(rule)
+        rules = self.repo.get_rules(rule.prj_id, "dbo")
+        staged = next((row for row in rules if int(row.get("scope_id") or 0) == int(scope_id)), None)
+        if staged is None:
+            raise HTTPException(status_code=409, detail=f"Display record for scope_id {scope_id} is missing.")
+        staged = dict(staged)
         staged["prompt_description"] = prompt_description
         staged["examples"] = examples
-        staged.pop("scope_id", None)
-        for field in ("created_at", "updated_at", "created_by", "updated_by"):
+        for field in ("scope_id", "display_id", "created_at", "updated_at", "created_by", "updated_by",
+                      "portfolio", "portfolio_name", "sector_name", "is_active"):
             staged.pop(field, None)
 
         master_row = model_dict(master)
@@ -1186,3 +1181,4 @@ class DataDictionaryService:
             self.db.rollback()
             raise
         return {"scope_id": scope_id, "staged": True}
+

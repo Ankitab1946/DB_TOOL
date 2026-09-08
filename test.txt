@@ -1,0 +1,4 @@
+curl.exe -v https://api.company-information.service.gov.uk/company/00000006
+curl.exe -u "YOUR_API_KEY:" https://api.company-information.service.gov.uk/company/00000006
+
+python -m pip install --upgrade requests certifi urllib3

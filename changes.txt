@@ -1,36 +1,23 @@
-src/DataDictionaryAdminApp/streamlit_app.py
-src/DataDictionaryAdminApp/api/schemas_api.py
-src/DataDictionaryAdminApp/core/target_tables.py
 src/DataDictionaryAdminApp/model/entities.py
+src/DataDictionaryAdminApp/api/schemas_api.py
+src/DataDictionaryAdminApp/repositories/data_dictionary_repository.py
+src/DataDictionaryAdminApp/streamlit_app.py
+
+Old :
+src/DataDictionaryAdminApp/streamlit_app.py
+src/DataDictionaryAdminApp/config.py
+src/DataDictionaryAdminApp/core/database.py
+src/DataDictionaryAdminApp/core/target_tables.py
+src/DataDictionaryAdminApp/api/routers/system.py
 src/DataDictionaryAdminApp/repositories/data_dictionary_repository.py
 src/DataDictionaryAdminApp/service/data_dictionary_service.py
-src/DataDictionaryAdminApp/service/excel_service.py
-src/DataDictionaryAdminApp/utils/normalizers.py
+src/DataDictionaryAdminApp/service/s3_service.py
 
+---------------------------------------------------------
 src/DataDictionaryAdminApp/sql/001_create_tables.sql
 src/DataDictionaryAdminApp/sql/002_validate_schema.sql
-src/DataDictionaryAdminApp/sql/004_add_report_type_scope_fields.sql        ← NEW
+src/DataDictionaryAdminApp/sql/007_rename_portfolio_remark_to_remarks.sql
 
 src/DataDictionaryAdminApp/sql/postgres/001_create_tables.sql
 src/DataDictionaryAdminApp/sql/postgres/002_validate_schema.sql
-src/DataDictionaryAdminApp/sql/postgres/004_add_report_type_scope_fields.sql ← NEW
-
-1. Stop FastAPI and Streamlit
-
-2. Take DB backup
-
-3. Run:
-   003_add_scoped_definition_segment.sql
-   ↓
-4. Run:
-   004_add_report_type_scope_fields.sql
-   ↓
-5. Run:
-   002_validate_schema.sql
-
-6. Confirm:
-   Schema validation passed
-
-7. Start FastAPI
-
-8. Start Streamlit
+src/DataDictionaryAdminApp/sql/postgres/007_rename_portfolio_remark_to_remarks.sql

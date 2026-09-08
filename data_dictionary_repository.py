@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import MetaData, Table, and_, delete, distinct, false, func, inspect, or_, select, text, true
 from sqlalchemy.orm import Session
 
+from DataDictionaryAdminApp.core.target_tables import TARGET_TABLE_DEFAULTS
 from DataDictionaryAdminApp.model.entities import (
     AttributeBusinessRule,
     AttributeDisplay,
@@ -99,10 +100,59 @@ class DataDictionaryRepository:
     def __init__(self, db: Session):
         self.db = db
 
+    def _session_info(self) -> dict[str, Any]:
+        info = getattr(self.db, "info", None)
+        return info if isinstance(info, dict) else {}
+
+    def target_table_name(self, key: str) -> str:
+        names = self._session_info().get("target_table_names") or TARGET_TABLE_DEFAULTS
+        return str(names.get(key) or TARGET_TABLE_DEFAULTS[key])
+
     def _physical_schema(self, logical: str) -> str:
         bind = self.db.get_bind()
-        return ({"dbo": "prj_dbd", "stg": "prj_stage"}.get(logical, logical)
-                if bind.dialect.name == "postgresql" else logical)
+        if bind.dialect.name == "postgresql":
+            info = self._session_info()
+            return {
+                "dbo": str(info.get("pg_schema") or "prj_dbd"),
+                "stg": str(info.get("staging_schema") or "prj_stage"),
+            }.get(logical, logical)
+        return logical
+
+    def qualified_target_table(self, key: str) -> str:
+        logical_schema = "stg" if key.startswith("stg_") else "dbo"
+        return f"{self._physical_schema(logical_schema)}.{self.target_table_name(key)}"
+
+    def _physical_target_table(self, key: str, metadata: MetaData | None = None) -> Table:
+        """Reflect exactly one UI-selected physical target without following legacy FKs.
+
+        Custom Actual/Final tables are allowed to retain foreign-key metadata that
+        references an older/default table basename.  Finalize preview only needs the
+        selected table's own columns, so resolving referenced tables can cause false
+        reflection failures.  Disable request table-name rewriting during reflection
+        and do not recursively resolve foreign keys.
+        """
+        logical_schema = "stg" if key.startswith("stg_") else "dbo"
+        physical_schema = self._physical_schema(logical_schema)
+        reflection_bind = self.db.get_bind().execution_options(target_table_rewrites=())
+        return Table(
+            self.target_table_name(key),
+            metadata or MetaData(),
+            schema=physical_schema,
+            autoload_with=reflection_bind,
+            resolve_fks=False,
+        )
+
+    def _audited_table_name(self, schema_name: str, table_name: str) -> str:
+        mapping = {
+            ("stg", TARGET_TABLE_DEFAULTS["stg_master"]): "stg_master",
+            ("stg", TARGET_TABLE_DEFAULTS["stg_business"]): "stg_business",
+            ("stg", TARGET_TABLE_DEFAULTS["stg_display"]): "stg_display",
+            ("dbo", TARGET_TABLE_DEFAULTS["final_master"]): "final_master",
+            ("dbo", TARGET_TABLE_DEFAULTS["final_business"]): "final_business",
+            ("dbo", TARGET_TABLE_DEFAULTS["final_display"]): "final_display",
+        }
+        key = mapping.get((schema_name, table_name))
+        return self.target_table_name(key) if key else table_name
 
     def portfolio_model(self):
         """Return the physical portfolio-reference ORM model for this engine."""
@@ -110,21 +160,21 @@ class DataDictionaryRepository:
         return PostgresPortfolioReference if bind.dialect.name == "postgresql" else PortfolioReference
 
     def portfolio_table_name(self) -> str:
-        return ("prj_dbd.prj_portfolio_reference"
+        return (f"{self._physical_schema('dbo')}.prj_portfolio_reference"
                 if self.db.get_bind().dialect.name == "postgresql"
                 else "dbo.prj_portfolio_reference_new_test")
 
     def hard_delete_dictionary_data(self) -> dict[str, int]:
         deleted: dict[str, int] = {}
         targets = (
-            ("stg.prj_attribute_display_test", StagingAttributeDisplay),
-            ("stg.prj_attribute_business_rules_new_test", StagingBusinessRule),
-            ("dbo.prj_attribute_display_test", AttributeDisplay),
-            ("dbo.prj_attribute_business_rules_new_test", AttributeBusinessRule),
-            ("stg.prj_attribute_master_new_test", StagingAttributeMaster),
-            ("dbo.prj_attribute_master_new_test", AttributeMaster),
-            ("dbo.raw_prj_attribute_new_test", RawAttribute),
-            ("dbo.audit_table_new_test", AuditTable),
+            (f"{self._physical_schema('stg')}.{self.target_table_name('stg_display')}", StagingAttributeDisplay),
+            (f"{self._physical_schema('stg')}.{self.target_table_name('stg_business')}", StagingBusinessRule),
+            (f"{self._physical_schema('dbo')}.{self.target_table_name('final_display')}", AttributeDisplay),
+            (f"{self._physical_schema('dbo')}.{self.target_table_name('final_business')}", AttributeBusinessRule),
+            (f"{self._physical_schema('stg')}.{self.target_table_name('stg_master')}", StagingAttributeMaster),
+            (f"{self._physical_schema('dbo')}.{self.target_table_name('final_master')}", AttributeMaster),
+            (f"{self._physical_schema('dbo')}.raw_prj_attribute_new_test", RawAttribute),
+            (f"{self._physical_schema('dbo')}.audit_table_new_test", AuditTable),
         )
         for table_name, model in targets:
             count = int(self.db.scalar(select(func.count()).select_from(model)) or 0)
@@ -143,10 +193,11 @@ class DataDictionaryRepository:
         # Persist the physical schema name in audit history. SQL Server keeps
         # dbo/stg; PostgreSQL translates those logical schemas to prj_dbd/prj_stage.
         physical_schema = self._physical_schema(schema_name)
+        physical_table = self._audited_table_name(schema_name, table_name)
         self.db.add(
             AuditTable(
                 schema_name=physical_schema,
-                table_name=table_name,
+                table_name=physical_table,
                 record_key=str(record_key),
                 action=action,
                 before_value=_json(before),
@@ -169,22 +220,26 @@ class DataDictionaryRepository:
         values: list[str] = []
         if bind.dialect.name == "postgresql":
             inspector = inspect(bind)
+            main_schema = self._physical_schema("dbo")
+            staging_schema = self._physical_schema("stg")
+            stg_master_name = self.target_table_name("stg_master")
+            final_master_name = self.target_table_name("final_master")
             required = (
-                ("prj_dbd", "raw_prj_attribute_new_test"),
-                ("prj_stage", "prj_attribute_master_new_test"),
-                ("prj_dbd", "prj_attribute_master_new_test"),
+                (main_schema, "raw_prj_attribute_new_test"),
+                (staging_schema, stg_master_name),
+                (main_schema, final_master_name),
             )
             missing = [f"{schema}.{table}" for schema, table in required if not inspector.has_table(table, schema=schema)]
             if missing:
                 raise RuntimeError(
                     "PostgreSQL Data Dictionary schema is not ready. Missing required table(s): "
                     + ", ".join(missing)
-                    + ". Run the PostgreSQL setup/migration scripts and then 002_validate_schema.sql."
+                    + ". Check Target Tables in the sidebar or run the PostgreSQL setup/migration scripts and 002_validate_schema.sql."
                 )
             stmt = text(
-                "SELECT prj_id FROM prj_dbd.raw_prj_attribute_new_test "
-                "UNION ALL SELECT prj_id FROM prj_stage.prj_attribute_master_new_test "
-                "UNION ALL SELECT prj_id FROM prj_dbd.prj_attribute_master_new_test"
+                f"SELECT prj_id FROM {main_schema}.raw_prj_attribute_new_test "
+                f"UNION ALL SELECT prj_id FROM {staging_schema}.{stg_master_name} "
+                f"UNION ALL SELECT prj_id FROM {main_schema}.{final_master_name}"
             )
             values.extend(str(value) for value in self.db.scalars(stmt).all() if value)
         else:
@@ -334,7 +389,7 @@ class DataDictionaryRepository:
 
         if bind.dialect.name == "postgresql":
             inspector = inspect(bind)
-            schema, table_name = "prj_dbd", "prj_portfolio_reference"
+            schema, table_name = self._physical_schema("dbo"), "prj_portfolio_reference"
             if not inspector.has_table(table_name, schema=schema):
                 raise RuntimeError(f"Required PostgreSQL portfolio table {schema}.{table_name} does not exist.")
             table = Table(table_name, MetaData(), schema=schema, autoload_with=bind)
@@ -346,7 +401,7 @@ class DataDictionaryRepository:
                     + ", ".join(missing)
                 )
 
-            optional = ("sub_sector", "remark", "is_active", "created_at", "updated_at", "created_by", "updated_by")
+            optional = ("sub_sector", "remarks", "is_active", "created_at", "updated_at", "created_by", "updated_by")
             columns = [table.c[name] for name in required]
             columns.extend(table.c[name] for name in optional if name in table.c)
             # PostgreSQL Portfolio/Scope is an authoritative reference lookup.
@@ -361,7 +416,7 @@ class DataDictionaryRepository:
                     "portfolio_name": mapping.get("portfolio_name"),
                     "sector_name": mapping.get("sector_name"),
                     "sub_sector": mapping.get("sub_sector"),
-                    "remark": mapping.get("remark"),
+                    "remarks": mapping.get("remarks"),
                     "is_active": True if mapping.get("is_active") is None else bool(mapping.get("is_active")),
                     "created_at": mapping.get("created_at"),
                     "updated_at": mapping.get("updated_at"),
@@ -460,6 +515,130 @@ class DataDictionaryRepository:
     def preload_final_state(self, prj_ids: set[str]):
         return self.preload_state(prj_ids, "dbo")
 
+    def has_custom_target_tables(self) -> bool:
+        """Return True when any staging/final table basename differs from the default."""
+        names = self._session_info().get("target_table_names") or TARGET_TABLE_DEFAULTS
+        return any(str(names.get(key) or TARGET_TABLE_DEFAULTS[key]) != default for key, default in TARGET_TABLE_DEFAULTS.items())
+
+    def preload_target_state(
+        self, prj_ids: set[str], schema: str = "dbo"
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        """Read staging/final state from the exact UI-selected physical tables.
+
+        This path is used by Finalize preview/delta when custom table names are
+        configured. It deliberately reflects the selected table basenames rather
+        than depending on compiled ORM-name rewriting, so changing only Actual /
+        Final table names is immediately visible in the delta comparison.
+        """
+        if not prj_ids:
+            return {}, {}
+        side = "stg" if schema == "stg" else "final"
+        logical_schema = "stg" if side == "stg" else "dbo"
+        metadata = MetaData()
+        try:
+            master = self._physical_target_table(f"{side}_master", metadata)
+            business = self._physical_target_table(f"{side}_business", metadata)
+            display = self._physical_target_table(f"{side}_display", metadata)
+        except Exception as exc:
+            targets = ", ".join(
+                self.qualified_target_table(f"{side}_{name}") for name in ("master", "business", "display")
+            )
+            raise RuntimeError(
+                f"Unable to read the selected {side} target tables ({targets}). "
+                f"Check that the tables exist and match the expected dictionary structure. Database error: {exc}"
+            ) from exc
+
+        required = {
+            "master": {"prj_id", "prj_attribute_name", "prj_physical_attribute_name", "is_active"},
+            "business": {
+                "scope_id", "prj_id", "port_ref_id", "source_abbr_name", "prompt_description",
+                "examples_for_llm", "editable", "data_type", "attribute_type", "business_logic",
+                "calculation_logic",
+            },
+            "display": {
+                "display_id", "scope_id", "display_order", "prj_id", "display_name", "section",
+                "subsection", "prj_attribute_definition", "prj_attribute_description", "segment", "report_type",
+            },
+        }
+        missing: list[str] = []
+        for label, table in (("master", master), ("business", business), ("display", display)):
+            for column in sorted(required[label] - set(table.c.keys())):
+                missing.append(f"{table.schema}.{table.name}.{column}")
+        if "where_in_financial_statement" not in master.c and "segment" not in master.c:
+            missing.append(f"{master.schema}.{master.name}.segment/where_in_financial_statement")
+        if missing:
+            raise RuntimeError(
+                "Selected target table structure is missing required column(s): " + ", ".join(missing)
+            )
+
+        master_rows = self.db.execute(select(master).where(master.c.prj_id.in_(prj_ids))).mappings().all()
+        masters: dict[str, dict[str, Any]] = {}
+        for row in master_rows:
+            item = dict(row)
+            # PostgreSQL master tables physically use ``segment`` while the shared
+            # service/API contract keeps the legacy logical field name for SQL Server
+            # compatibility and to avoid changing existing UI payloads.
+            if "where_in_financial_statement" not in item and "segment" in item:
+                item["where_in_financial_statement"] = item.get("segment")
+            masters[str(item["prj_id"])] = item
+        active_by_prj = {key: bool(value.get("is_active", True)) for key, value in masters.items()}
+        rules: dict[str, list[dict[str, Any]]] = {key: [] for key in prj_ids}
+        stmt = (
+            select(
+                business.c.scope_id.label("scope_id"),
+                business.c.prj_id.label("prj_id"),
+                business.c.port_ref_id.label("port_ref_id"),
+                business.c.source_abbr_name.label("source_abbr_name"),
+                business.c.prompt_description.label("prompt_description"),
+                business.c.examples_for_llm.label("examples"),
+                business.c.editable.label("editable"),
+                business.c.data_type.label("symbol"),
+                business.c.attribute_type.label("mapping_type"),
+                business.c.business_logic.label("tech_logic"),
+                business.c.calculation_logic.label("calculation_logic"),
+                display.c.display_id.label("display_id"),
+                display.c.display_order.label("display_order"),
+                display.c.display_name.label("display_name"),
+                display.c.section.label("section"),
+                display.c.subsection.label("subsection"),
+                display.c.prj_attribute_definition.label("prj_attribute_definition"),
+                display.c.prj_attribute_description.label("prj_attribute_description"),
+                display.c.segment.label("segment"),
+                display.c.report_type.label("report_type"),
+            )
+            .select_from(business.join(display, display.c.scope_id == business.c.scope_id))
+            .where(business.c.prj_id.in_(prj_ids))
+            .order_by(business.c.prj_id, business.c.port_ref_id, display.c.display_order, business.c.scope_id)
+        )
+        for row in self.db.execute(stmt).mappings().all():
+            item = dict(row)
+            item["is_active"] = active_by_prj.get(str(item["prj_id"]), True)
+            rules.setdefault(str(item["prj_id"]), []).append(item)
+        return masters, rules
+
+    def target_staging_prj_ids(self) -> list[str]:
+        """Read pending PRJ IDs from the exact selected staging master table."""
+        master = self._physical_target_table("stg_master")
+        return [str(value) for value in self.db.scalars(select(master.c.prj_id).order_by(master.c.prj_id)).all()]
+
+    def clear_target_staging(self, prj_ids: list[str]) -> None:
+        """Delete selected pending rows from the exact UI-selected staging tables."""
+        if not prj_ids:
+            return
+        metadata = MetaData()
+        business = self._physical_target_table("stg_business", metadata)
+        display = self._physical_target_table("stg_display", metadata)
+        master = self._physical_target_table("stg_master", metadata)
+        scope_ids = select(business.c.scope_id).where(business.c.prj_id.in_(prj_ids))
+        self.db.execute(delete(display).where(display.c.scope_id.in_(scope_ids)))
+        self.db.execute(delete(business).where(business.c.prj_id.in_(prj_ids)))
+        self.db.execute(delete(master).where(master.c.prj_id.in_(prj_ids)))
+
+    def delete_raw_for_prj_ids(self, prj_ids: list[str]) -> None:
+        """Remove raw rows for discarded brand-new attributes so IDs/names are released."""
+        if prj_ids:
+            self.db.execute(delete(RawAttribute).where(RawAttribute.prj_id.in_(prj_ids)))
+
     def preload_original_mapping_types(self, prj_ids: set[str]) -> dict[str, str | None]:
         result = {prj_id: None for prj_id in prj_ids}
         if not prj_ids:
@@ -480,15 +659,32 @@ class DataDictionaryRepository:
                     result[prj_id] = str(value)
         return result
 
-    def preload_physical_names(self) -> tuple[dict[str, str], dict[str, str]]:
-        owners: dict[str, str] = {}; by_prj: dict[str, str] = {}
-        for model in (StagingAttributeMaster, AttributeMaster, RawAttribute):
+    def preload_physical_names(self) -> tuple[dict[str, set[str]], dict[str, str]]:
+        """Preload every physical-name owner plus the preferred name per PRJ.
+
+        A physical name can temporarily be present for more than one PRJ across
+        staging/raw/final (for example after an older bulk upload generated a
+        duplicate that only fails at Finalize).  Do not collapse that state to a
+        single owner: the bulk allocator needs to see *all* owners before deciding
+        whether a generated name is safe.
+
+        The preferred name for an existing PRJ comes from Final first, then
+        staging, then raw.  This keeps blank MERGE uploads for established PRJs on
+        their canonical Final physical name when it is still unique.
+        """
+        owners: dict[str, set[str]] = {}
+        by_prj: dict[str, str] = {}
+        for model in (AttributeMaster, StagingAttributeMaster, RawAttribute):
             stmt = select(model.prj_id, model.prj_physical_attribute_name)
-            if model is RawAttribute: stmt = stmt.order_by(model.raw_row_id)
+            if model is RawAttribute:
+                stmt = stmt.order_by(model.raw_row_id)
             for prj_id, value in self.db.execute(stmt).all():
                 name = str(value or "").strip()
-                if name:
-                    owners.setdefault(name.casefold(), str(prj_id)); by_prj.setdefault(str(prj_id).strip().casefold(), name)
+                prj_text = str(prj_id or "").strip()
+                if not name or not prj_text:
+                    continue
+                owners.setdefault(name.casefold(), set()).add(prj_text)
+                by_prj.setdefault(prj_text.casefold(), name)
         return owners, by_prj
 
     def final_detail(self, prj_id: str) -> dict[str, Any] | None:

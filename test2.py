@@ -1,14 +1,21 @@
 import requests
-import certifi
+import truststore
 
-print(certifi.where())
+truststore.inject_into_ssl()
+
+API_KEY = "PASTE_YOUR_API_KEY_HERE".strip()
+
+URL = (
+    "https://api.company-information.service.gov.uk"
+    "/company/00000006"
+)
 
 response = requests.get(
-    "https://api.company-information.service.gov.uk/company/00000006",
-    auth=("YOUR_API_KEY", ""),
-    verify=certifi.where(),
+    URL,
+    auth=(API_KEY, ""),
     timeout=30
 )
 
-print(response.status_code)
+print("Status:", response.status_code)
+print("Response:")
 print(response.text)

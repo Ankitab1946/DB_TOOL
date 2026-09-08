@@ -1,27 +1,5 @@
-src/DataDictionaryAdminApp/streamlit_app.py
-
-src/DataDictionaryAdminApp/api/schemas_api.py
-
-src/DataDictionaryAdminApp/api/routers/data_dictionary.py
+src/DataDictionaryAdminApp/service/data_dictionary_service.py
 
 src/DataDictionaryAdminApp/repositories/data_dictionary_repository.py
 
-src/DataDictionaryAdminApp/service/data_dictionary_service.py
-
-tests/test_discard_finalize_and_custom_final_reflection.py
-
-________
-
-src/DataDictionaryAdminApp/api/schemas_api.py
-src/DataDictionaryAdminApp/model/entities.py
-src/DataDictionaryAdminApp/service/data_dictionary_service.py
-src/DataDictionaryAdminApp/service/excel_service.py
-src/DataDictionaryAdminApp/utils/normalizers.py
-
-src/DataDictionaryAdminApp/sql/001_create_tables.sql
-src/DataDictionaryAdminApp/sql/002_validate_schema.sql
-src/DataDictionaryAdminApp/sql/010_default_section_subsection_na.sql
-
-src/DataDictionaryAdminApp/sql/postgres/001_create_tables.sql
-src/DataDictionaryAdminApp/sql/postgres/002_validate_schema.sql
-src/DataDictionaryAdminApp/sql/postgres/010_default_section_subsection_na.sql
+tests/test_bulk_auto_physical_name_uniqueness.py

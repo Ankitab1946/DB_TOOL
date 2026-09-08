@@ -30,6 +30,7 @@ from DataDictionaryAdminApp.utils.normalizers import (
     mapping_type_from_value,
     normalize_pipe_values,
     normalize_text,
+    pair_nullable_pipe_values,
     pair_pipe_values,
 )
 
@@ -71,7 +72,7 @@ class DataDictionaryService:
         self._source_name_cache: dict[str, str] | None = None
         self._source_code_cache: set[str] | None = None
         self._original_type_cache: dict[str, str | None] | None = None
-        self._physical_owner_cache: dict[str, str] | None = None
+        self._physical_owner_cache: dict[str, set[str]] | None = None
         self._physical_by_prj_cache: dict[str, str] | None = None
 
     def prepare_bulk_cache(self, payloads: list[AttributeUpsert]) -> None:
@@ -93,7 +94,14 @@ class DataDictionaryService:
         # Bulk caches must use case-insensitive CFV/PRJ identity semantics. SQL Server
         # installations are commonly case-insensitive, and PostgreSQL should behave
         # consistently for application identifiers as well.
-        self._physical_owner_cache = {str(name).casefold(): str(owner) for name, owner in owners.items()}
+        self._physical_owner_cache = {
+            str(name).casefold(): {
+                str(owner).strip()
+                for owner in (owner_values if isinstance(owner_values, (set, list, tuple)) else [owner_values])
+                if str(owner).strip()
+            }
+            for name, owner_values in owners.items()
+        }
         self._physical_by_prj_cache = {str(prj_id).casefold(): str(name) for prj_id, name in by_prj.items()}
 
     def validate_bulk_physical_name_uniqueness(self, payloads: list[AttributeUpsert]) -> None:
@@ -124,22 +132,31 @@ class DataDictionaryService:
         duplicates: list[dict[str, Any]] = []
         for name_key, entry in incoming.items():
             incoming_ids: dict[str, str] = entry["incoming_ids"]
-            existing_owner = None if self._physical_owner_cache is None else self._physical_owner_cache.get(name_key)
-            distinct_id_keys = set(incoming_ids)
-            if existing_owner:
-                distinct_id_keys.add(self._prj_identity_key(existing_owner))
+            existing_values = None if self._physical_owner_cache is None else self._physical_owner_cache.get(name_key)
+            existing_display_ids: dict[str, str] = {}
+            if existing_values is not None:
+                values = existing_values if isinstance(existing_values, (set, list, tuple)) else [existing_values]
+                for value in values:
+                    text = normalize_text(value)
+                    if text:
+                        existing_display_ids.setdefault(self._prj_identity_key(text), text)
+
+            distinct_id_keys = set(incoming_ids) | set(existing_display_ids)
             if len(distinct_id_keys) <= 1:
                 continue
 
-            all_ids: dict[str, str] = dict(incoming_ids)
-            if existing_owner:
-                all_ids.setdefault(self._prj_identity_key(existing_owner), str(existing_owner))
+            all_ids: dict[str, str] = dict(existing_display_ids)
+            all_ids.update(incoming_ids)
+            existing_ids = sorted(existing_display_ids.values(), key=str.casefold)
             duplicates.append(
                 {
                     "physical_attribute_name": entry["physical_attribute_name"],
                     "cfv_ids": sorted(all_ids.values(), key=str.casefold),
                     "incoming_cfv_ids": sorted(incoming_ids.values(), key=str.casefold),
-                    "existing_database_cfv_id": str(existing_owner) if existing_owner else None,
+                    # Preserve the old singular field for clients while exposing all
+                    # DB owners when a stale cross-table duplicate already exists.
+                    "existing_database_cfv_id": existing_ids[0] if len(existing_ids) == 1 else None,
+                    "existing_database_cfv_ids": existing_ids,
                 }
             )
 
@@ -192,6 +209,18 @@ class DataDictionaryService:
     def _prj_identity_key(prj_id: str | None) -> str:
         return normalize_text(prj_id).casefold()
 
+    @classmethod
+    def _physical_owner_keys(cls, owners: Any) -> set[str]:
+        """Normalize cached owner value(s) to case-insensitive PRJ identities.
+
+        Accepting the legacy scalar form keeps older callers/tests compatible while
+        the live bulk preload now stores a set so no database owner is masked.
+        """
+        if owners is None:
+            return set()
+        values = owners if isinstance(owners, (set, list, tuple)) else [owners]
+        return {cls._prj_identity_key(str(value)) for value in values if normalize_text(value)}
+
     def _physical_name_cached(self, prj_id: str) -> str | None:
         if self._physical_by_prj_cache is not None:
             return self._physical_by_prj_cache.get(self._prj_identity_key(prj_id))
@@ -200,13 +229,21 @@ class DataDictionaryService:
     def _physical_exists_cached(self, name: str, exclude_prj_id: str | None = None) -> bool:
         if self._physical_owner_cache is None:
             return self.repo.physical_name_exists(name, exclude_prj_id=exclude_prj_id)
-        owner = self._physical_owner_cache.get(name.casefold())
-        return bool(owner and self._prj_identity_key(owner) != self._prj_identity_key(exclude_prj_id))
+        owner_keys = self._physical_owner_keys(self._physical_owner_cache.get(name.casefold()))
+        excluded = self._prj_identity_key(exclude_prj_id)
+        if excluded:
+            owner_keys.discard(excluded)
+        return bool(owner_keys)
 
     def _reserve_physical_cached(self, name: str, prj_id: str) -> None:
         """Reserve an accepted physical name inside the current bulk operation."""
         if self._physical_owner_cache is not None:
-            self._physical_owner_cache[name.casefold()] = prj_id
+            key = name.casefold()
+            current = self._physical_owner_cache.get(key)
+            if not isinstance(current, set):
+                current = {str(current).strip()} if current and str(current).strip() else set()
+                self._physical_owner_cache[key] = current
+            current.add(prj_id)
         if self._physical_by_prj_cache is not None:
             self._physical_by_prj_cache[self._prj_identity_key(prj_id)] = name
 
@@ -214,11 +251,14 @@ class DataDictionaryService:
         if self._physical_owner_cache is None:
             return self.repo.available_physical_name(base_name, exclude_prj_id=prj_id)
         base = base_name.strip() or "attribute"
+        requested_prj = self._prj_identity_key(prj_id)
         for suffix in range(1, 10001):
             suffix_text = "" if suffix == 1 else f"_{suffix}"
             candidate = base if suffix == 1 else f"{base[:500-len(suffix_text)]}{suffix_text}"
-            owner = self._physical_owner_cache.get(candidate.casefold())
-            if not owner or self._prj_identity_key(owner) == self._prj_identity_key(prj_id):
+            owner_keys = self._physical_owner_keys(self._physical_owner_cache.get(candidate.casefold()))
+            # Candidate is reusable only when it is unused or every known owner is
+            # the same PRJ. Any other owner forces the next deterministic suffix.
+            if not owner_keys or owner_keys <= {requested_prj}:
                 self._reserve_physical_cached(candidate, prj_id)
                 return candidate
         raise ValueError(f"Could not generate a unique PRJ Physical Attribute Name from '{base}'.")
@@ -274,9 +314,11 @@ class DataDictionaryService:
         existing_physical = self._physical_name_cached(prj_id)
 
         if auto_physical:
-            # Blank bulk/UI input must not erase an existing physical name. For a
-            # new PRJ ID, generate a deterministic unique variant from the acronym.
-            if existing_physical:
+            # Blank bulk/UI input must not erase a *valid* existing physical name.
+            # A stale staging/raw name can already conflict with another Final PRJ
+            # (the exact condition that used to surface only at PostgreSQL Finalize),
+            # so reuse is allowed only after checking every cached/database owner.
+            if existing_physical and not self._physical_exists_cached(existing_physical, exclude_prj_id=prj_id):
                 physical_name = existing_physical
                 self._reserve_physical_cached(physical_name, prj_id)
             else:
@@ -308,12 +350,10 @@ class DataDictionaryService:
             source_abbr_name = self._source_code_cached(payload.source_name, payload.source_abbr_name)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        section = normalize_pipe_values(payload.section)
-        subsection = normalize_pipe_values(payload.sub_section)
-        if not section or not subsection:
-            raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
+        section = normalize_pipe_values(payload.section) or "N/A"
+        subsection = normalize_pipe_values(payload.sub_section) or "N/A"
         try:
-            scope_pairs = pair_pipe_values(section, subsection)
+            scope_pairs = pair_nullable_pipe_values(section, subsection)
             pair_count = len(scope_pairs)
             segment_values = align_pipe_values(payload.segment, pair_count, "Segment", default="NA")
             definition_values = align_pipe_values(payload.attribute_definition, pair_count, "Attribute Definition", default=None)
@@ -413,11 +453,9 @@ class DataDictionaryService:
     def _expand_raw_pairs(raw: dict[str, Any]) -> list[dict[str, Any]]:
         """Expand pipe-separated raw Section/Sub-Section values into positional rows."""
         try:
-            pairs = pair_pipe_values(raw.get("section"), raw.get("sub_section"))
+            pairs = pair_nullable_pipe_values(raw.get("section"), raw.get("sub_section"))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if not pairs:
-            raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
         pair_count = len(pairs)
         try:
             segments = align_pipe_values(raw.get("segment"), pair_count, "Segment", default="NA")
@@ -450,11 +488,9 @@ class DataDictionaryService:
     def _expand_rule_pairs(rule: dict[str, Any]) -> list[dict[str, Any]]:
         """Expand pipe-separated Section/Sub-Section values into positional rule rows."""
         try:
-            pairs = pair_pipe_values(rule.get("section"), rule.get("subsection"))
+            pairs = pair_nullable_pipe_values(rule.get("section"), rule.get("subsection"))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if not pairs:
-            raise HTTPException(status_code=422, detail="Section and Sub-Section cannot be blank.")
         pair_count = len(pairs)
         try:
             definitions = align_pipe_values(rule.get("prj_attribute_definition"), pair_count, "Attribute Definition", default=None)
@@ -542,12 +578,21 @@ class DataDictionaryService:
             "prj_physical_attribute_name": master["prj_physical_attribute_name"],
             "raw_rows_staged": len(raw_rows),
             "business_rule_rows_staged": len(rules),
-            "staged_tables": [
-                "dbo.raw_prj_attribute_new_test",
-                "stg.prj_attribute_master_new_test",
-                "stg.prj_attribute_business_rules_new_test",
-                "stg.prj_attribute_display_test",
-            ],
+            "staged_tables": (
+                [
+                    f"{self.repo._physical_schema('dbo')}.raw_prj_attribute_new_test",
+                    self.repo.qualified_target_table("stg_master"),
+                    self.repo.qualified_target_table("stg_business"),
+                    self.repo.qualified_target_table("stg_display"),
+                ]
+                if hasattr(self.repo, "qualified_target_table") and hasattr(self.repo, "_physical_schema")
+                else [
+                    "dbo.raw_prj_attribute_new_test",
+                    "stg.prj_attribute_master_new_test",
+                    "stg.prj_attribute_business_rules_new_test",
+                    "stg.prj_attribute_display_test",
+                ]
+            ),
         }
 
     def stage_attribute(self, payload: AttributeUpsert, user: str, source_operation: str = "UI") -> dict[str, Any]:
@@ -567,10 +612,12 @@ class DataDictionaryService:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "Could not save the attribute to raw/staging tables. "
-                    "Verify that dbo.raw_prj_attribute_new_test, stg.prj_attribute_master_new_test, "
-                    "stg.prj_attribute_business_rules_new_test and stg.prj_attribute_display_test exist and match "
-                    f"the supplied SQL scripts. Database error: {detail}"
+                    "Could not save the attribute to raw/staging tables. Verify that "
+                    f"{self.repo._physical_schema('dbo')}.raw_prj_attribute_new_test, "
+                    f"{self.repo.qualified_target_table('stg_master')}, "
+                    f"{self.repo.qualified_target_table('stg_business')} and "
+                    f"{self.repo.qualified_target_table('stg_display')} exist and have the expected columns. "
+                    f"Database error: {detail}"
                 ),
             ) from exc
         except Exception:
@@ -873,13 +920,35 @@ class DataDictionaryService:
         return changed
 
     def delta(self) -> dict[str, Any]:
-        prj_ids = self.repo.staging_prj_ids()
-        if not prj_ids:
-            return {"count": 0, "rows": [], "has_changes": False}
+        custom_targets = hasattr(self.repo, "has_custom_target_tables") and self.repo.has_custom_target_tables()
+        try:
+            # For custom target names, even the pending-ID scan must use the exact
+            # selected staging table.  This avoids mixing ORM default basenames with
+            # a custom Actual/Final target during Finalize preview.
+            prj_ids = self.repo.target_staging_prj_ids() if custom_targets else self.repo.staging_prj_ids()
+            if not prj_ids:
+                return {"count": 0, "rows": [], "has_changes": False}
 
-        id_set = set(prj_ids)
-        staged_masters, staged_rules_by_prj = self.repo.preload_state(id_set, "stg")
-        final_masters, final_rules_by_prj = self.repo.preload_state(id_set, "dbo")
+            id_set = set(prj_ids)
+            if custom_targets:
+                staged_masters, staged_rules_by_prj = self.repo.preload_target_state(id_set, "stg")
+                final_masters, final_rules_by_prj = self.repo.preload_target_state(id_set, "dbo")
+            else:
+                staged_masters, staged_rules_by_prj = self.repo.preload_state(id_set, "stg")
+                final_masters, final_rules_by_prj = self.repo.preload_state(id_set, "dbo")
+        except HTTPException:
+            raise
+        except (SQLAlchemyError, RuntimeError) as exc:
+            detail = str(getattr(exc, "orig", exc))[:1500]
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Finalize preview could not read the selected staging/Actual tables. "
+                    f"Selected targets: {self.repo.qualified_target_table('stg_master')} → "
+                    f"{self.repo.qualified_target_table('final_master')}. Database error: {detail}"
+                ),
+            ) from exc
+
         items: list[dict[str, Any]] = []
 
         for prj_id in prj_ids:
@@ -1107,35 +1176,49 @@ class DataDictionaryService:
         coupling publication to the SQL Server logical ``dbo/stg`` ORM names and to
         the legacy SQL Server portfolio table name.
         """
-        bind = self.db.get_bind()
+        # Reflect the six configurable targets without recursively resolving
+        # foreign keys. A renamed table can legitimately retain FK metadata that
+        # names the former/default table; following that metadata is unnecessary
+        # for publication and was the source of custom-final-name reflection 500s.
+        reflection_bind = self.db.get_bind().execution_options(target_table_rewrites=())
         metadata = MetaData()
-        specs = {
-            "stg_master": ("prj_stage", "prj_attribute_master_new_test"),
-            "stg_business": ("prj_stage", "prj_attribute_business_rules_new_test"),
-            "stg_display": ("prj_stage", "prj_attribute_display_test"),
-            "final_master": ("prj_dbd", "prj_attribute_master_new_test"),
-            "final_business": ("prj_dbd", "prj_attribute_business_rules_new_test"),
-            "final_display": ("prj_dbd", "prj_attribute_display_test"),
-            "audit": ("prj_dbd", "audit_table_new_test"),
-            "portfolio": ("prj_dbd", "prj_portfolio_reference"),
-        }
+        main_schema = str(self.db.info.get("pg_schema") or "prj_dbd")
+        staging_schema = str(self.db.info.get("staging_schema") or "prj_stage")
         tables: dict[str, Table] = {}
         try:
-            for key, (schema, name) in specs.items():
-                tables[key] = Table(name, metadata, schema=schema, autoload_with=bind)
+            target_specs = {
+                "stg_master": (staging_schema, self.repo.target_table_name("stg_master")),
+                "stg_business": (staging_schema, self.repo.target_table_name("stg_business")),
+                "stg_display": (staging_schema, self.repo.target_table_name("stg_display")),
+                "final_master": (main_schema, self.repo.target_table_name("final_master")),
+                "final_business": (main_schema, self.repo.target_table_name("final_business")),
+                "final_display": (main_schema, self.repo.target_table_name("final_display")),
+            }
+            for key, (schema, name) in target_specs.items():
+                tables[key] = Table(
+                    name, metadata, schema=schema, autoload_with=reflection_bind, resolve_fks=False,
+                )
+            tables["audit"] = Table(
+                "audit_table_new_test", metadata, schema=main_schema,
+                autoload_with=reflection_bind, resolve_fks=False,
+            )
+            tables["portfolio"] = Table(
+                "prj_portfolio_reference", metadata, schema=main_schema,
+                autoload_with=reflection_bind, resolve_fks=False,
+            )
         except SQLAlchemyError as exc:
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "PostgreSQL Finalize schema is not ready. Required physical tables are under "
-                    "prj_stage/prj_dbd, including prj_dbd.prj_portfolio_reference. "
+                    "PostgreSQL Finalize schema is not ready. Check the sidebar Target Tables and required "
+                    f"schemas {staging_schema}/{main_schema}, including {main_schema}.prj_portfolio_reference. "
                     f"Database error: {str(getattr(exc, 'orig', exc))[:1200]}"
                 ),
             ) from exc
 
         required_columns = {
-            "stg_master": {"prj_id", "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name", "where_in_financial_statement", "is_active"},
-            "final_master": {"prj_id", "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name", "where_in_financial_statement", "is_active"},
+            "stg_master": {"prj_id", "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name", "segment", "is_active"},
+            "final_master": {"prj_id", "prj_attribute_name", "prj_attribute_definition", "prj_physical_attribute_name", "segment", "is_active"},
             "stg_business": {"scope_id", "prj_id", "port_ref_id", "source_abbr_name", "prompt_description", "examples_for_llm", "editable", "data_type", "attribute_type", "business_logic", "calculation_logic"},
             "final_business": {"scope_id", "prj_id", "port_ref_id", "source_abbr_name", "prompt_description", "examples_for_llm", "editable", "data_type", "attribute_type", "business_logic", "calculation_logic"},
             "stg_display": {"display_id", "scope_id", "display_order", "prj_id", "display_name", "section", "subsection", "prj_attribute_definition", "prj_attribute_description", "segment", "report_type"},
@@ -1198,7 +1281,7 @@ class DataDictionaryService:
                 status_code=409,
                 detail=(
                     "Finalize blocked because staged Portfolio/Scope IDs are not present in "
-                    "prj_dbd.prj_portfolio_reference: " + ", ".join(map(str, missing_ports))
+                    f"{portfolio.schema}.prj_portfolio_reference: " + ", ".join(map(str, missing_ports))
                 ),
             )
 
@@ -1212,7 +1295,7 @@ class DataDictionaryService:
                 "prj_attribute_name": staged_master.get("prj_attribute_name"),
                 "prj_attribute_definition": staged_master.get("prj_attribute_definition"),
                 "prj_physical_attribute_name": staged_master.get("prj_physical_attribute_name"),
-                "where_in_financial_statement": staged_master.get("where_in_financial_statement") or "NA",
+                "segment": staged_master.get("segment") or staged_master.get("where_in_financial_statement") or "NA",
                 "is_active": bool(staged_master.get("is_active")),
                 "updated_at": now,
                 "updated_by": user,
@@ -1221,11 +1304,11 @@ class DataDictionaryService:
                 before = dict(existing_master)
                 self.db.execute(update(fm).where(fm.c.prj_id == prj_id).values(**master_values))
                 after = dict(before); after.update(master_values)
-                self._postgres_audit(audit, "prj_dbd", fm.name, prj_id, "UPDATE", before, after, user)
+                self._postgres_audit(audit, str(fm.schema), fm.name, prj_id, "UPDATE", before, after, user)
             else:
                 insert_values = {"prj_id": prj_id, **master_values, "created_at": now, "created_by": user}
                 self.db.execute(insert(fm).values(**insert_values))
-                self._postgres_audit(audit, "prj_dbd", fm.name, prj_id, "INSERT", None, insert_values, user)
+                self._postgres_audit(audit, str(fm.schema), fm.name, prj_id, "INSERT", None, insert_values, user)
 
             if not bool(staged_master.get("is_active")):
                 continue
@@ -1303,15 +1386,15 @@ class DataDictionaryService:
                     self.db.execute(update(fd).where(fd.c.display_id == display_id).values(**display_values))
                     after_business = dict(before_business); after_business.update(business_values)
                     after_display = dict(before_display); after_display.update(display_values)
-                    self._postgres_audit(audit, "prj_dbd", fb.name, scope_id, "UPDATE", dict(before_business), after_business, user)
-                    self._postgres_audit(audit, "prj_dbd", fd.name, display_id, "UPDATE", dict(before_display), after_display, user)
+                    self._postgres_audit(audit, str(fb.schema), fb.name, scope_id, "UPDATE", dict(before_business), after_business, user)
+                    self._postgres_audit(audit, str(fd.schema), fd.name, display_id, "UPDATE", dict(before_display), after_display, user)
                 else:
                     b_insert = {**business_values, "created_at": now, "created_by": user}
                     scope_id = int(self.db.execute(insert(fb).values(**b_insert).returning(fb.c.scope_id)).scalar_one())
                     d_insert = {**display_values, "scope_id": scope_id, "created_at": now, "created_by": user}
                     display_id = int(self.db.execute(insert(fd).values(**d_insert).returning(fd.c.display_id)).scalar_one())
-                    self._postgres_audit(audit, "prj_dbd", fb.name, scope_id, "INSERT", None, {"scope_id": scope_id, **b_insert}, user)
-                    self._postgres_audit(audit, "prj_dbd", fd.name, display_id, "INSERT", None, {"display_id": display_id, **d_insert}, user)
+                    self._postgres_audit(audit, str(fb.schema), fb.name, scope_id, "INSERT", None, {"scope_id": scope_id, **b_insert}, user)
+                    self._postgres_audit(audit, str(fd.schema), fd.name, display_id, "INSERT", None, {"display_id": display_id, **d_insert}, user)
                 seen_ports[port_ref_id] = seen_ports.get(port_ref_id, 0) + 1
 
         # Clear only the PRJ IDs that were successfully published.  Child display
@@ -1322,6 +1405,73 @@ class DataDictionaryService:
         self.db.execute(delete(sm).where(sm.c.prj_id.in_(prj_ids)))
         self.db.commit()
         return {"updated": len(prj_ids), "delta": delta, "message": "Database tables updated successfully."}
+
+    def discard_finalize(self, user: str, prj_ids: list[str], confirm: bool) -> dict[str, Any]:
+        """Discard selected unfinalized PRJ changes without touching Final data.
+
+        Staging is the transactional working copy. Removing selected staging rows
+        makes reads immediately fall back to the unchanged Final rows. Brand-new
+        PRJs that do not exist in Final also have their raw rows removed so their
+        generated ID/physical name is released for future use.
+        """
+        if not confirm:
+            raise HTTPException(status_code=400, detail="Discard Finalize requires confirm=true.")
+        requested = [str(value or "").strip() for value in prj_ids if str(value or "").strip()]
+        if not requested:
+            raise HTTPException(status_code=422, detail="Select at least one pending PRJ ID to discard.")
+
+        pending_delta = self.delta()
+        pending_by_key = {str(row["prj_id"]).casefold(): str(row["prj_id"]) for row in pending_delta.get("rows", [])}
+        selected: list[str] = []
+        missing: list[str] = []
+        seen: set[str] = set()
+        for value in requested:
+            key = value.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            if key in pending_by_key:
+                selected.append(pending_by_key[key])
+            else:
+                missing.append(value)
+        if missing:
+            raise HTTPException(
+                status_code=409,
+                detail="These PRJ IDs are no longer pending in Finalize: " + ", ".join(missing),
+            )
+
+        custom_targets = self.repo.has_custom_target_tables()
+        try:
+            selected_set = set(selected)
+            if custom_targets:
+                final_masters, _ = self.repo.preload_target_state(selected_set, "dbo")
+                self.repo.clear_target_staging(selected)
+            else:
+                final_masters, _ = self.repo.preload_state(selected_set, "dbo")
+                self.repo.clear_staging(selected)
+
+            new_prj_ids = [prj_id for prj_id in selected if final_masters.get(prj_id) is None]
+            # A discarded new attribute must not continue reserving its generated
+            # PRJ ID or physical attribute name in the raw input layer.
+            self.repo.delete_raw_for_prj_ids(new_prj_ids)
+            self.db.commit()
+        except HTTPException:
+            self.db.rollback()
+            raise
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self.db.rollback()
+            detail = str(getattr(exc, "orig", exc))[:1500]
+            raise HTTPException(status_code=500, detail=f"Discard Finalize failed: {detail}") from exc
+        except Exception as exc:
+            self.db.rollback()
+            raise HTTPException(status_code=500, detail=f"Discard Finalize failed: {str(exc)[:1500]}") from exc
+
+        return {
+            "discarded": len(selected),
+            "prj_ids": selected,
+            "new_prj_ids_removed_from_raw": new_prj_ids,
+            "message": f"Discarded {len(selected)} pending PRJ ID(s). Final tables were not changed.",
+        }
 
     def finalize(self, user: str, confirm: bool) -> dict[str, Any]:
         if not confirm:

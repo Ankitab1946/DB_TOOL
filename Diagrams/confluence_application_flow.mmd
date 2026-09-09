@@ -1,0 +1,95 @@
+flowchart LR
+    U[User] --> UI[Streamlit UI]
+
+    subgraph UIA[User Actions]
+      C[Create / Edit Attribute]
+      X[Excel Bulk Upload\nMERGE / REPLACE / INSERT_ONLY]
+      V[View Latest / Filters]
+      F[Finalize and Upload]
+      D[Discard Finalize]
+      A[Audit / S3 Export]
+    end
+
+    UI --> C
+    UI --> X
+    UI --> V
+    UI --> F
+    UI --> D
+    UI --> A
+
+    C --> API[FastAPI]
+    X --> API
+    V --> API
+    F --> API
+    D --> API
+    A --> API
+
+    API --> SVC[DataDictionaryService]
+    SVC --> REPO[DataDictionaryRepository]
+    REPO --> DB[SQLAlchemy / psycopg]
+
+    subgraph REF[PostgreSQL Reference Data - prj_dbd]
+      P[prj_portfolio_reference]
+      DS[prj_data_sources\nread-only external]
+    end
+
+    subgraph RAW[Raw Intake - prj_dbd]
+      R[raw_prj_attribute_new_test]
+    end
+
+    subgraph STG[Staging - prj_stage]
+      SM[prj_attribute_master_new_test]
+      SB[prj_attribute_business_rules_new_test]
+      SD[prj_attribute_display_test]
+    end
+
+    subgraph FIN[Actual / Final - prj_dbd]
+      FM[prj_attribute_master_new_test]
+      FB[prj_attribute_business_rules_new_test]
+      FD[prj_attribute_display_test]
+      AU[audit_table_new_test]
+    end
+
+    DB --> P
+    DB --> DS
+    DB --> R
+    DB --> SM
+    DB --> SB
+    DB --> SD
+    DB --> FM
+    DB --> FB
+    DB --> FD
+    DB --> AU
+
+    X -->|Parse, validate, normalize| R
+    C -->|Stage changes| R
+    R -->|Transform / stage| SM
+    R -->|Scope/business data| SB
+    R -->|Display metadata| SD
+
+    P -->|port_ref_id| SB
+    DS -. source_code / source_abbr_name .-> SB
+
+    SM -->|Validate & Compare Delta| F
+    SB -->|Validate & Compare Delta| F
+    SD -->|Validate & Compare Delta| F
+
+    F -->|Publish selected staged changes| FM
+    F -->|Publish scopes| FB
+    F -->|Publish display rows| FD
+    F -->|Write before/after history| AU
+
+    D -->|Delete selected pending rows only| SM
+    D -->|Delete selected pending rows only| SB
+    D -->|Delete selected pending rows only| SD
+    D -. Final tables unchanged .-> FIN
+
+    V -->|Joined read| FM
+    V -->|Joined read| FB
+    V -->|Joined read| FD
+
+    NOTE[Default table basenames shown.\nStaging/Final basenames can be changed from UI Target Tables.]:::note
+    NOTE -.-> STG
+    NOTE -.-> FIN
+
+    classDef note fill:#f6f6f6,stroke:#777,color:#222;

@@ -1,0 +1,136 @@
+erDiagram
+    PRJ_PORTFOLIO_REFERENCE ||--o{ STG_BUSINESS_RULES : "port_ref_id"
+    PRJ_PORTFOLIO_REFERENCE ||--o{ FINAL_BUSINESS_RULES : "port_ref_id"
+
+    STG_MASTER ||--o{ STG_BUSINESS_RULES : "prj_id"
+    STG_MASTER ||--o{ STG_DISPLAY : "prj_id"
+    STG_BUSINESS_RULES ||--|| STG_DISPLAY : "scope_id"
+
+    FINAL_MASTER ||--o{ FINAL_BUSINESS_RULES : "prj_id"
+    FINAL_MASTER ||--o{ FINAL_DISPLAY : "prj_id"
+    FINAL_BUSINESS_RULES ||--|| FINAL_DISPLAY : "scope_id"
+
+    PRJ_DATA_SOURCES ||..o{ STG_BUSINESS_RULES : "source_code = source_abbr_name (logical)"
+    PRJ_DATA_SOURCES ||..o{ FINAL_BUSINESS_RULES : "source_code = source_abbr_name (logical)"
+
+    RAW_ATTRIBUTE {
+      bigint raw_row_id PK
+      varchar portfolio
+      varchar prj_id
+      varchar prj_attribute_name
+      varchar prj_physical_attribute_name
+      varchar section "default N/A"
+      varchar sub_section "default N/A"
+      varchar data_type
+      varchar calculated_or_reported
+      text calculation_logic
+      varchar segment
+      varchar report_type
+      text attribute_definition
+      text attribute_description
+      int display_order
+      text tech_logic
+      varchar display_name
+      boolean is_active
+    }
+
+    PRJ_PORTFOLIO_REFERENCE {
+      int port_ref_id PK
+      varchar portfolio_name
+      varchar sector_name
+      varchar sub_sector
+      varchar remarks
+      boolean is_active
+    }
+
+    PRJ_DATA_SOURCES {
+      varchar source_code PK
+      varchar source_name
+    }
+
+    STG_MASTER {
+      varchar prj_id PK
+      varchar prj_attribute_name
+      text prj_attribute_definition
+      varchar prj_physical_attribute_name UK
+      varchar segment
+      boolean is_active
+    }
+
+    STG_BUSINESS_RULES {
+      bigint scope_id PK
+      varchar prj_id FK
+      int port_ref_id FK
+      varchar source_abbr_name
+      text prompt_description
+      text examples_for_llm
+      char editable
+      varchar data_type
+      varchar attribute_type
+      text business_logic
+      text calculation_logic
+    }
+
+    STG_DISPLAY {
+      bigint display_id PK
+      bigint scope_id FK_UK
+      int display_order
+      varchar prj_id FK
+      varchar display_name
+      varchar section "default N/A"
+      varchar subsection "default N/A"
+      text prj_attribute_definition
+      text prj_attribute_description
+      varchar segment
+      varchar report_type
+    }
+
+    FINAL_MASTER {
+      varchar prj_id PK
+      varchar prj_attribute_name
+      text prj_attribute_definition
+      varchar prj_physical_attribute_name UK
+      varchar segment
+      boolean is_active
+    }
+
+    FINAL_BUSINESS_RULES {
+      bigint scope_id PK
+      varchar prj_id FK
+      int port_ref_id FK
+      varchar source_abbr_name
+      text prompt_description
+      text examples_for_llm
+      char editable
+      varchar data_type
+      varchar attribute_type
+      text business_logic
+      text calculation_logic
+    }
+
+    FINAL_DISPLAY {
+      bigint display_id PK
+      bigint scope_id FK_UK
+      int display_order
+      varchar prj_id FK
+      varchar display_name
+      varchar section "default N/A"
+      varchar subsection "default N/A"
+      text prj_attribute_definition
+      text prj_attribute_description
+      varchar segment
+      varchar report_type
+    }
+
+    AUDIT_TABLE {
+      bigint audit_id PK
+      varchar schema_name
+      varchar table_name
+      varchar record_key
+      varchar action
+      text before_value
+      text after_value
+      varchar source_operation
+      varchar performed_by
+      timestamp performed_at
+    }

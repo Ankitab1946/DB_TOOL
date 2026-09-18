@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -12,23 +11,21 @@ import requests
 import streamlit as st
 from streamlit_modal import Modal
 
+from DataDictionaryAdminApp.config import bootstrap_runtime_config
+from DataDictionaryAdminApp.core.target_tables import (
+    TARGET_TABLE_DEFAULTS,
+    TARGET_TABLE_HEADERS,
+    TARGET_TABLE_LABELS,
+    validate_table_name,
+    validate_target_table_set,
+)
 from DataDictionaryAdminApp.service.excel_service import STANDARD_FIELDS
 from DataDictionaryAdminApp.utils.normalizers import align_int_pipe_values, align_pipe_values, canonical_portfolio_label, generate_physical_name, generate_tech_logic, pair_pipe_values, portfolio_from_sheet_name
 
 
-def load_env() -> None:
-    candidates = [Path.cwd() / ".env", *[parent / ".env" for parent in Path(__file__).resolve().parents]]
-    for path in candidates:
-        if path.exists():
-            for raw in path.read_text(encoding="utf-8").splitlines():
-                raw = raw.strip()
-                if raw and not raw.startswith("#") and "=" in raw:
-                    key, value = raw.split("=", 1)
-                    os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-            break
 
-
-load_env()
+# Cloud: prefer Helm/Kubernetes env/config/YAML. Local .env remains a fallback.
+bootstrap_runtime_config()
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8503/api/v1").rstrip("/")
 API = API_BASE if API_BASE.endswith("/api/v1") else API_BASE + "/api/v1"
 READ_TIMEOUT = int(os.getenv("API_READ_TIMEOUT_SECONDS", "120"))
@@ -81,14 +78,25 @@ st.markdown(
 )
 
 
+def current_target_table_names(db_type: str | None = None) -> dict[str, str]:
+    kind = (db_type or st.session_state.get("database_type") or "POSTGRES").upper()
+    mappings = st.session_state.get("target_table_names_by_db") or {}
+    selected = mappings.get(kind) or {}
+    return {key: str(selected.get(key) or default) for key, default in TARGET_TABLE_DEFAULTS.items()}
+
+
 def headers() -> dict[str, str]:
-    return {
+    db_type = st.session_state.get("database_type", "POSTGRES").upper()
+    result = {
         "X-App-Environment": st.session_state.get("environment", os.getenv("SELECTED_ENVIRONMENT", "LOCAL")),
-        "X-DB-Type": st.session_state.get("database_type", os.getenv("SELECTED_DB_TYPE", "SQLSERVER")),
+        "X-DB-Type": db_type,
         "X-App-User": CURRENT_USER,
         "X-App-Role": st.session_state.get("role", os.getenv("SELECTED_ROLE", "ADMIN")).upper(),
         "Accept": "application/json",
     }
+    for key, header_name in TARGET_TABLE_HEADERS.items():
+        result[header_name] = current_target_table_names(db_type)[key]
+    return result
 
 
 def format_api_error_detail(detail: Any) -> str:
@@ -209,7 +217,7 @@ def database_status_check() -> dict[str, Any]:
 
         result = database_connection_status(
             st.session_state.get("environment", os.getenv("SELECTED_ENVIRONMENT", "LOCAL")),
-            st.session_state.get("database_type", os.getenv("SELECTED_DB_TYPE", "SQLSERVER")),
+            st.session_state.get("database_type", "POSTGRES"),
         )
         result["status_source"] = "DIRECT_FALLBACK"
         result["api_issue"] = api_issue
@@ -225,7 +233,7 @@ def database_status_check() -> dict[str, Any]:
 
 for key, default in {
     "environment": os.getenv("SELECTED_ENVIRONMENT", "LOCAL"),
-    "database_type": os.getenv("SELECTED_DB_TYPE", "SQLSERVER").upper(),
+    "database_type": "POSTGRES",
     "role": os.getenv("SELECTED_ROLE", "ADMIN").upper(),
     "view_rows": [],
     "view_total": 0,
@@ -258,6 +266,9 @@ for key, default in {
     "latest_excel": None,
     "edit_unlocked": False,
     "show_finalize_confirm": False,
+    "finalize_in_progress": False,
+    "discard_finalize_in_progress": False,
+    "discard_finalize_prj_ids": [],
     "show_soft_deleted": False,
     "show_cleanup": False,
     "cleanup_step": 0,
@@ -266,6 +277,12 @@ for key, default in {
     "flash_message": None,
 }.items():
     st.session_state.setdefault(key, default)
+
+if "target_table_names_by_db" not in st.session_state:
+    st.session_state["target_table_names_by_db"] = {
+        "POSTGRES": dict(TARGET_TABLE_DEFAULTS),
+        "SQLSERVER": dict(TARGET_TABLE_DEFAULTS),
+    }
 
 context_key = f"{st.session_state['environment']}:{st.session_state['database_type']}:{st.session_state['role']}"
 if st.session_state.get("runtime_context_key") != context_key or st.session_state.get("runtime_context") is None:
@@ -278,6 +295,8 @@ context = st.session_state.get("runtime_context") or {
     "db_types": ["SQLSERVER", "POSTGRES"],
     "database": "Unknown",
     "server": "Unknown",
+    "main_schema": "prj_dbd" if st.session_state["database_type"] == "POSTGRES" else "dbo",
+    "staging_schema": "prj_stage" if st.session_state["database_type"] == "POSTGRES" else "stg",
     "current_user": CURRENT_USER,
     "role": st.session_state.get("role", "ADMIN"),
     "is_admin": st.session_state.get("role", "ADMIN") == "ADMIN",
@@ -306,9 +325,9 @@ with st.sidebar:
     # for the selected environment is shown below without removing the selector.
     db_types = ["SQLSERVER", "POSTGRES"]
     db_labels = {"SQLSERVER": "SQL Server", "POSTGRES": "PostgreSQL"}
-    current_db_type = st.session_state.get("database_type", "SQLSERVER").upper()
+    current_db_type = st.session_state.get("database_type", "POSTGRES").upper()
     if current_db_type not in db_types:
-        current_db_type = "SQLSERVER"
+        current_db_type = "POSTGRES"
     selected_db_type = st.selectbox(
         "Database Type",
         db_types,
@@ -370,6 +389,53 @@ with st.sidebar:
         if db_status.get("api_issue"):
             st.caption(f"API status issue: {db_status['api_issue']}")
 
+    # Show and edit the physical staging/final target table names for the
+    # currently selected database. Values are maintained separately for
+    # PostgreSQL and SQL Server and sent with every API request.
+    active_db = st.session_state["database_type"]
+    active_names = current_target_table_names(active_db)
+    staging_schema = str(refreshed.get("staging_schema") or ("prj_stage" if active_db == "POSTGRES" else "stg"))
+    main_schema = str(refreshed.get("main_schema") or ("prj_dbd" if active_db == "POSTGRES" else "dbo"))
+    with st.expander("Target Tables", expanded=True):
+        st.caption("These are the staging and final tables the application will read/write. Schemas remain fixed by database type.")
+        with st.form(f"target_tables_form_{active_db}", clear_on_submit=False):
+            edited_names: dict[str, str] = {}
+            st.markdown(f"**Staging — `{staging_schema}`**")
+            for key in ("stg_master", "stg_business", "stg_display"):
+                edited_names[key] = st.text_input(
+                    TARGET_TABLE_LABELS[key],
+                    value=active_names[key],
+                    key=f"target_{active_db}_{key}",
+                    help=f"Physical target: {staging_schema}.<table name>",
+                )
+            st.markdown(f"**Actual / Final — `{main_schema}`**")
+            for key in ("final_master", "final_business", "final_display"):
+                edited_names[key] = st.text_input(
+                    TARGET_TABLE_LABELS[key],
+                    value=active_names[key],
+                    key=f"target_{active_db}_{key}",
+                    help=f"Physical target: {main_schema}.<table name>",
+                )
+            apply_targets = st.form_submit_button("Apply Table Names", width="stretch")
+
+        if apply_targets:
+            try:
+                validated = validate_target_table_set(edited_names)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                mappings = dict(st.session_state.get("target_table_names_by_db") or {})
+                mappings[active_db] = validated
+                st.session_state["target_table_names_by_db"] = mappings
+                st.session_state["view_loaded"] = False
+                st.session_state["lookup_cache"] = None
+                st.session_state["prompts_cache"] = None
+                st.session_state["audit_cache_rows"] = None
+                st.session_state["soft_deleted_cache"] = None
+                st.session_state["flash_message"] = f"Target table names applied for {db_labels.get(active_db, active_db)}."
+                st.rerun()
+
+
     if not refreshed.get("database_enabled", False):
         st.warning("Database access is disabled for this environment.")
 
@@ -415,6 +481,7 @@ def source_label(code: str) -> str:
     return f"{code}[{source_by_code.get(code, code)}]"
 
 finalize_modal = Modal("Finalize and Upload", key="finalize_modal", max_width=720)
+discard_finalize_modal = Modal("Discard Finalize", key="discard_finalize_modal", max_width=760)
 cleanup_modal = Modal("Cleanup Database", key="cleanup_database_modal", max_width=980)
 
 
@@ -1414,25 +1481,71 @@ with main_tabs[0]:
 
     with finalize_tab:
         st.subheader("Finalize and Upload")
+        finalize_targets = current_target_table_names(st.session_state.get("database_type"))
+        finalize_staging_schema = str(refreshed.get("staging_schema") or ("prj_stage" if st.session_state.get("database_type") == "POSTGRES" else "stg"))
+        finalize_main_schema = str(refreshed.get("main_schema") or ("prj_dbd" if st.session_state.get("database_type") == "POSTGRES" else "dbo"))
+        st.caption(
+            "Finalize preview compares the currently selected targets: "
+            f"{finalize_staging_schema}.{finalize_targets['stg_master']} → "
+            f"{finalize_main_schema}.{finalize_targets['final_master']} "
+            "(Business Rules and Attribute Display use their corresponding selected table names)."
+        )
         delta = (
             {"rows": [], "has_changes": False, "count": 0}
             if modal_active
-            else (api("GET", "/data-dictionary/delta", quiet=True) or {"rows": [], "has_changes": False, "count": 0})
+            else (api("GET", "/data-dictionary/delta", quiet=False) or {"rows": [], "has_changes": False, "count": 0})
         )
         st.caption(f"Pending delta: {delta.get('count', 0)} attribute(s)")
+        selected_discard_ids: list[str] = []
         if delta.get("rows"):
-            st.dataframe(pd.DataFrame(delta["rows"]), width="stretch", hide_index=True)
+            delta_event = st.dataframe(
+                pd.DataFrame(delta["rows"]),
+                width="stretch",
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="multi-row",
+                key="finalize_delta_grid",
+            )
+            selected_indices = list(getattr(getattr(delta_event, "selection", None), "rows", []) or [])
+            selected_discard_ids = [
+                str(delta["rows"][index]["prj_id"])
+                for index in selected_indices
+                if isinstance(index, int) and 0 <= index < len(delta["rows"])
+            ]
+            st.caption(
+                f"Selected for discard: {len(selected_discard_ids)} PRJ ID(s). "
+                "Discard removes only their pending staging changes; Actual / Final data is not modified."
+            )
         else:
             st.info("No staged changes. Finalize is disabled.")
-        if is_admin:
-            c1, c2 = st.columns(2)
-        else:
-            c1 = st.container()
-            c2 = None
-        if c1.button("Finalize and Upload", type="primary", disabled=not delta.get("has_changes"), width="stretch"):
+
+        # Backward-compatible role gate equivalent to the prior: if is_admin and c2 is not None:
+        action_columns = st.columns(3 if is_admin else 2)
+        c_finalize = action_columns[0]
+        c_discard = action_columns[1]
+        c_s3 = action_columns[2] if is_admin else None
+        if c_finalize.button(
+            "Finalize and Upload",
+            type="primary",
+            disabled=not delta.get("has_changes") or bool(st.session_state.get("finalize_in_progress")),
+            width="stretch",
+        ):
+            st.session_state["finalize_in_progress"] = False
             finalize_modal.open()
-        if is_admin and c2 is not None:
-            if c2.button("Save Final Tables to S3", width="stretch"):
+        if c_discard.button(
+            "Discard Selected Changes",
+            disabled=(
+                not selected_discard_ids
+                or bool(st.session_state.get("finalize_in_progress"))
+                or bool(st.session_state.get("discard_finalize_in_progress"))
+            ),
+            width="stretch",
+        ):
+            st.session_state["discard_finalize_prj_ids"] = selected_discard_ids
+            st.session_state["discard_finalize_in_progress"] = False
+            discard_finalize_modal.open()
+        if is_admin and c_s3 is not None:
+            if c_s3.button("Save Final Tables to S3", width="stretch"):
                 result = api("POST", "/s3/export-final")
                 if result:
                     st.success(f"Uploaded {len(result.get('files', []))} final-table extract(s) to S3.")
@@ -1514,13 +1627,13 @@ if is_admin:
             p_name = c1.text_input("Portfolio Name")
             sector = c2.text_input("Sector Name")
             sub_sector = c1.text_input("Sub-Sector")
-            remark = c2.text_input("Remark")
+            remarks = c2.text_input("Remarks")
             if st.button("Insert Portfolio", disabled=not refreshed.get("is_admin")):
                 result = api("POST", "/portfolio-reference", json={
                     "portfolio_name": p_name,
                     "sector_name": sector,
                     "sub_sector": sub_sector or None,
-                    "remark": remark or None,
+                    "remarks": remarks or None,
                 })
                 if result:
                     st.session_state["lookup_cache"] = None
@@ -1555,7 +1668,7 @@ if st.session_state.get("show_cleanup"):
     if cleanup_modal.is_open():
         with cleanup_modal.container():
             selected_environment = st.session_state.get("environment", "LOCAL")
-            selected_database_type = st.session_state.get("database_type", "SQLSERVER")
+            selected_database_type = st.session_state.get("database_type", "POSTGRES")
             selected_database_name = str((st.session_state.get("runtime_context") or {}).get("database", "Unknown"))
             st.error("Destructive operation: hard delete")
             st.write(
@@ -1643,11 +1756,13 @@ if st.session_state.get("show_cleanup"):
 
 if finalize_modal.is_open():
     with finalize_modal.container():
-        st.warning("Do you want to update database tables?")
-        c1, c2 = st.columns(2)
-        if c1.button("Yes Upload", type="primary", width="stretch"):
-            result = api("POST", "/data-dictionary/finalize", json={"confirm": True})
+        finalize_in_progress = bool(st.session_state.get("finalize_in_progress"))
+        if finalize_in_progress:
+            st.info("Finalize and Upload is in progress. Please do not submit again.")
+            with st.spinner("Loading staged changes into the selected Actual / Final tables..."):
+                result = api("POST", "/data-dictionary/finalize", json={"confirm": True})
             if result:
+                loaded_count = int(result.get("updated", 0) or 0)
                 st.session_state["view_loaded"] = False
                 st.session_state["lookup_cache"] = None
                 st.session_state["prompts_cache"] = None
@@ -1656,9 +1771,102 @@ if finalize_modal.is_open():
                 st.session_state["soft_deleted_cache"] = None
                 st.session_state["upload_preview"] = None
                 st.session_state["upload_stage_result"] = None
-                st.success(result.get("message", "Finalized successfully."))
+                st.session_state["finalize_in_progress"] = False
+                st.session_state["flash_message"] = (
+                    f"Finalize completed successfully. {loaded_count} PRJ ID(s) were loaded into the selected Actual / Final tables."
+                )
                 finalize_modal.close()
                 st.rerun()
-        if c2.button("Cancel", width="stretch"):
+            else:
+                # Keep the confirmation open after an API error so the user can
+                # correct the issue and retry; importantly, re-enable the button.
+                st.session_state["finalize_in_progress"] = False
+                finalize_in_progress = False
+        else:
+            st.warning("Do you want to update database tables?")
+
+        c1, c2 = st.columns(2)
+        if c1.button(
+            "Yes Upload",
+            type="primary",
+            disabled=finalize_in_progress,
+            width="stretch",
+            key="finalize_yes_upload",
+        ):
+            st.session_state["finalize_in_progress"] = True
+            st.rerun()
+        if c2.button(
+            "Cancel",
+            disabled=finalize_in_progress,
+            width="stretch",
+            key="finalize_cancel",
+        ):
+            st.session_state["finalize_in_progress"] = False
             finalize_modal.close()
+            st.rerun()
+
+
+if discard_finalize_modal.is_open():
+    with discard_finalize_modal.container():
+        discard_ids = list(st.session_state.get("discard_finalize_prj_ids") or [])
+        discard_in_progress = bool(st.session_state.get("discard_finalize_in_progress"))
+        st.warning(
+            "Discard the selected pending changes? The selected staging rows will be removed and the application "
+            "will revert to the unchanged Actual / Final values for existing PRJ IDs. Final tables are not modified."
+        )
+        if discard_ids:
+            st.dataframe(
+                pd.DataFrame({"PRJ ID": discard_ids}),
+                width="stretch",
+                hide_index=True,
+                height=min(300, 42 + (len(discard_ids) * 35)),
+            )
+        if discard_in_progress:
+            st.info("Discard Finalize is in progress...")
+            with st.spinner("Removing the selected pending staging changes..."):
+                result = api(
+                    "POST",
+                    "/data-dictionary/discard-finalize",
+                    json={"prj_ids": discard_ids, "confirm": True},
+                )
+            if result:
+                discarded_count = int(result.get("discarded", 0) or 0)
+                st.session_state["view_loaded"] = False
+                st.session_state["lookup_cache"] = None
+                st.session_state["prompts_cache"] = None
+                st.session_state["audit_cache_rows"] = None
+                st.session_state["soft_deleted_cache"] = None
+                st.session_state["upload_preview"] = None
+                st.session_state["upload_stage_result"] = None
+                st.session_state["discard_finalize_in_progress"] = False
+                st.session_state["discard_finalize_prj_ids"] = []
+                st.session_state["flash_message"] = (
+                    f"Discard completed successfully. {discarded_count} pending PRJ ID(s) were reverted; "
+                    "Actual / Final tables were not changed."
+                )
+                discard_finalize_modal.close()
+                st.rerun()
+            else:
+                st.session_state["discard_finalize_in_progress"] = False
+                discard_in_progress = False
+
+        d1, d2 = st.columns(2)
+        if d1.button(
+            "Yes, Discard Selected",
+            type="primary",
+            disabled=discard_in_progress or not discard_ids,
+            width="stretch",
+            key="discard_finalize_confirm",
+        ):
+            st.session_state["discard_finalize_in_progress"] = True
+            st.rerun()
+        if d2.button(
+            "Cancel",
+            disabled=discard_in_progress,
+            width="stretch",
+            key="discard_finalize_cancel",
+        ):
+            st.session_state["discard_finalize_in_progress"] = False
+            st.session_state["discard_finalize_prj_ids"] = []
+            discard_finalize_modal.close()
             st.rerun()

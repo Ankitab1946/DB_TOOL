@@ -1,0 +1,29 @@
+# Example Helm DEV values. The application does not require a .env file in cloud.
+# Recommended: have Helm/Kubernetes inject these entries as container environment
+# variables. The application can also read this YAML directly when it is mounted and
+# APP_CONFIG_FILE points to it (for example /config/dev-values.yaml).
+
+env:
+  SELECTED_ENVIRONMENT: DEV
+  SELECTED_DB_TYPE: POSTGRES
+  ENABLE_POSTGRES: "true"
+  PG_HOST: postgres-dev.example.internal
+  PG_PORT: "5432"
+  PG_DATABASE: PRJ_DB
+  PG_SCHEMA: prj_dbd
+  POSTGRES_USER: prj_app
+  # Prefer a Kubernetes Secret for the password; shown only to document the key name.
+  POSTGRES_PASSWORD: ""
+  POSTGRES_SSLMODE: require
+  API_BASE_URL: http://prj-data-dictionary-api:8503/api/v1
+
+# Alternative nested form is also supported when the YAML itself is mounted/read:
+# database:
+#   postgres:
+#     host: postgres-dev.example.internal
+#     port: 5432
+#     database: PRJ_DB
+#     schema: prj_dbd
+#     user: prj_app
+#     password: ""
+#     sslmode: require

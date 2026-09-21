@@ -88,7 +88,7 @@ def current_target_table_names(db_type: str | None = None) -> dict[str, str]:
 def headers() -> dict[str, str]:
     db_type = st.session_state.get("database_type", "POSTGRES").upper()
     result = {
-        "X-App-Environment": st.session_state.get("environment", os.getenv("SELECTED_ENVIRONMENT", "LOCAL")),
+        "X-App-Environment": st.session_state.get("environment", os.getenv("SELECTED_ENVIRONMENT", "DEV")),
         "X-DB-Type": db_type,
         "X-App-User": CURRENT_USER,
         "X-App-Role": st.session_state.get("role", os.getenv("SELECTED_ROLE", "ADMIN")).upper(),
@@ -216,7 +216,7 @@ def database_status_check() -> dict[str, Any]:
         from DataDictionaryAdminApp.core.database import database_connection_status
 
         result = database_connection_status(
-            st.session_state.get("environment", os.getenv("SELECTED_ENVIRONMENT", "LOCAL")),
+            st.session_state.get("environment", os.getenv("SELECTED_ENVIRONMENT", "DEV")),
             st.session_state.get("database_type", "POSTGRES"),
         )
         result["status_source"] = "DIRECT_FALLBACK"
@@ -232,7 +232,9 @@ def database_status_check() -> dict[str, Any]:
 
 
 for key, default in {
-    "environment": os.getenv("SELECTED_ENVIRONMENT", "LOCAL"),
+    # Runtime Context defaults to DEV. Normalize Helm/YAML/env values so values
+    # such as "Dev" do not fall through to the first environment (LOCAL).
+    "environment": (os.getenv("SELECTED_ENVIRONMENT") or "DEV").strip().upper(),
     "database_type": "POSTGRES",
     "role": os.getenv("SELECTED_ROLE", "ADMIN").upper(),
     "view_rows": [],
@@ -304,10 +306,13 @@ context = st.session_state.get("runtime_context") or {
 
 with st.sidebar:
     st.subheader("Runtime Context")
-    environments = context.get("environments") or ["LOCAL"]
-    current_env = st.session_state.get("environment", environments[0])
+    environments = [str(value).strip().upper() for value in (context.get("environments") or ["DEV"]) if str(value).strip()]
+    if "DEV" not in environments:
+        environments.append("DEV")
+    current_env = str(st.session_state.get("environment") or "DEV").strip().upper()
     if current_env not in environments:
-        current_env = environments[0]
+        current_env = "DEV"
+        st.session_state["environment"] = "DEV"
     selected_env = st.selectbox("Environment", environments, index=environments.index(current_env))
     if selected_env != st.session_state.get("environment"):
         st.session_state["environment"] = selected_env
@@ -1667,7 +1672,7 @@ if st.session_state.get("show_cleanup"):
         cleanup_modal.open()
     if cleanup_modal.is_open():
         with cleanup_modal.container():
-            selected_environment = st.session_state.get("environment", "LOCAL")
+            selected_environment = st.session_state.get("environment", "DEV")
             selected_database_type = st.session_state.get("database_type", "POSTGRES")
             selected_database_name = str((st.session_state.get("runtime_context") or {}).get("database", "Unknown"))
             st.error("Destructive operation: hard delete")

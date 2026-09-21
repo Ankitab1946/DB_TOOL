@@ -309,11 +309,29 @@ with st.sidebar:
     environments = [str(value).strip().upper() for value in (context.get("environments") or ["DEV"]) if str(value).strip()]
     if "DEV" not in environments:
         environments.append("DEV")
+    # The sidebar widget has its own Streamlit state.  Initialise that state to
+    # DEV explicitly so an old/generated widget value (for example LOCAL) cannot
+    # override the intended page-load default.  Once initialised, normal user
+    # selections are preserved across Streamlit reruns.
+    if "runtime_environment_selector" not in st.session_state:
+        st.session_state["runtime_environment_selector"] = "DEV"
+        st.session_state["environment"] = "DEV"
+
+    raw_selector_env = str(st.session_state.get("runtime_environment_selector") or "DEV").strip()
+    selector_env = raw_selector_env.upper()
+    if selector_env not in environments:
+        selector_env = "DEV"
+    if raw_selector_env != selector_env:
+        st.session_state["runtime_environment_selector"] = selector_env
+
     current_env = str(st.session_state.get("environment") or "DEV").strip().upper()
     if current_env not in environments:
         current_env = "DEV"
         st.session_state["environment"] = "DEV"
-    selected_env = st.selectbox("Environment", environments, index=environments.index(current_env))
+
+    # Keep the visible widget and the request context aligned.  The explicit key
+    # prevents Streamlit's implicit widget state from restoring LOCAL on load.
+    selected_env = st.selectbox("Environment", environments, key="runtime_environment_selector")
     if selected_env != st.session_state.get("environment"):
         st.session_state["environment"] = selected_env
         st.session_state["view_loaded"] = False

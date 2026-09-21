@@ -11,15 +11,17 @@ This keeps local development convenient without requiring a ``.env`` file in DEV
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import requests
 import yaml
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, make_url
 
 
 SUPPORTED_DB_TYPES = ("SQLSERVER", "POSTGRES")
@@ -47,6 +49,18 @@ _RUNTIME_KEYS = {
     "PG_PORT",
     "PG_DATABASE",
     "PG_SCHEMA",
+    "PG_SA_URL_PATH",
+    "PG_VAULT_ROLE_NAME",
+    "SA_URL_PATH",
+    "SA_URLPATH",
+    "VAULT_ROLE_NAME",
+    "VAULT_ADDR",
+    "VAULT_TOKEN",
+    "VAULT_NAMESPACE",
+    "VAULT_AUTH_MOUNT",
+    "VAULT_K8S_JWT_PATH",
+    "VAULT_CA_CERT",
+    "VAULT_VERIFY_SSL",
     "POSTGRES_USER",
     "POSTGRES_PASSWORD",
     "POSTGRES_SSLMODE",
@@ -78,6 +92,22 @@ _RUNTIME_KEYS = {
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
 }
+
+
+_RUNTIME_KEY_ALIASES = {
+    # Helm values often use these exact camelCase names. After normalisation
+    # ``SaURLPath`` becomes ``SA_URLPATH`` and ``vaultRoleName`` becomes
+    # ``VAULT_ROLE_NAME``. Keep both forms compatible with PG-prefixed env keys.
+    "SA_URLPATH": "PG_SA_URL_PATH",
+    "SA_URL_PATH": "PG_SA_URL_PATH",
+    "VAULT_ROLE_NAME": "PG_VAULT_ROLE_NAME",
+    "VAULTROLENAME": "PG_VAULT_ROLE_NAME",
+}
+
+
+def _canonical_runtime_key(value: str) -> str:
+    key = _normalise_key(value)
+    return _RUNTIME_KEY_ALIASES.get(key, key)
 
 
 def _normalise_key(value: str) -> str:
@@ -139,7 +169,7 @@ def _yaml_candidates(environment: str) -> list[Path]:
         if value:
             candidates.append(Path(value))
 
-    env_name = (environment or "LOCAL").strip().lower()
+    env_name = (environment or "DEV").strip().lower()
     names = (f"{env_name}-values.yaml", f"values-{env_name}.yaml", f"{env_name}-values.yml", f"values-{env_name}.yml")
     roots = (
         Path.cwd(),
@@ -190,6 +220,10 @@ def _extract_yaml_values(document: Any) -> dict[str, str]:
         "DB": "PG_DATABASE",
         "NAME": "PG_DATABASE",
         "SCHEMA": "PG_SCHEMA",
+        "SA_URL_PATH": "PG_SA_URL_PATH",
+        "SA_URLPATH": "PG_SA_URL_PATH",
+        "VAULT_ROLE_NAME": "PG_VAULT_ROLE_NAME",
+        "VAULTROLENAME": "PG_VAULT_ROLE_NAME",
         "USER": "POSTGRES_USER",
         "USERNAME": "POSTGRES_USER",
         "PASSWORD": "POSTGRES_PASSWORD",
@@ -203,7 +237,7 @@ def _extract_yaml_values(document: Any) -> dict[str, str]:
         text = _scalar_text(value)
         if text is None:
             return
-        normalised = _normalise_key(key)
+        normalised = _canonical_runtime_key(key)
         if normalised:
             result[normalised] = text
 
@@ -217,7 +251,7 @@ def _extract_yaml_values(document: Any) -> dict[str, str]:
                     add(env_key, lowered["VALUE"])
 
             for raw_key, value in node.items():
-                key = _normalise_key(raw_key)
+                key = _canonical_runtime_key(raw_key)
                 next_path = (*path, key)
 
                 # Direct canonical leaf key anywhere in a values/config tree.
@@ -312,7 +346,7 @@ def runtime_config_values(environment: str | None = None) -> tuple[dict[str, str
     The returned values are ordered by source priority before process environment
     variables are considered: local .env < YAML < mounted config files.
     """
-    selected_env = (environment or os.getenv("SELECTED_ENVIRONMENT") or os.getenv("APP_ENV") or "LOCAL").strip().upper()
+    selected_env = (environment or os.getenv("SELECTED_ENVIRONMENT") or os.getenv("APP_ENV") or "DEV").strip().upper()
     values: dict[str, str] = {}
     sources: list[str] = []
 
@@ -364,9 +398,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=None, extra="ignore", case_sensitive=False)
 
     app_name: str = "PRJ Data Dictionary Administration Platform"
-    app_env: str = "LOCAL"
+    app_env: str = "DEV"
     app_environments: str = "LOCAL,DEV,UAT,PROD"
-    selected_environment: str = "LOCAL"
+    selected_environment: str = "DEV"
     selected_db_type: str = "POSTGRES"
     api_base_url: str = "http://localhost:8503/api/v1"
 
@@ -383,6 +417,14 @@ class Settings(BaseSettings):
     pg_port: int = 5432
     pg_database: str = "PRJ_DB"
     pg_schema: str = "prj_dbd"
+    pg_sa_url_path: str = ""
+    pg_vault_role_name: str = ""
+    vault_addr: str = ""
+    vault_namespace: str = ""
+    vault_auth_mount: str = "kubernetes"
+    vault_k8s_jwt_path: str = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    vault_ca_cert: str = ""
+    vault_verify_ssl: bool = True
     postgres_user: str = "postgres"
     postgres_password: str = ""
     postgres_sslmode: str = "prefer"
@@ -448,6 +490,18 @@ class Settings(BaseSettings):
             value = os.getenv(suffix)
         return default if value is None or value == "" else value
 
+    def _env_alias_value(self, environment: str, suffixes: tuple[str, ...], default: Any) -> Any:
+        """Resolve environment-specific/generic aliases in declared priority order."""
+        for suffix in suffixes:
+            value = os.getenv(f"ENV_{environment}_{suffix}")
+            if value is not None and value != "":
+                return value
+        for suffix in suffixes:
+            value = os.getenv(suffix)
+            if value is not None and value != "":
+                return value
+        return default
+
     def database_config(self, environment: str | None = None, db_type: str | None = None) -> dict[str, Any]:
         env = self.resolve_environment(environment)
         kind = self.resolve_db_type(db_type)
@@ -462,10 +516,28 @@ class Settings(BaseSettings):
                 "port": int(self._env_value(env, "PG_PORT", self.pg_port)),
                 "database": self._env_value(env, "PG_DATABASE", self.pg_database),
                 "schema": self._env_value(env, "PG_SCHEMA", self.pg_schema),
+                "sa_url_path": self._env_alias_value(
+                    env, ("PG_SA_URL_PATH", "SA_URL_PATH", "SA_URLPATH", "SaURLPath"), self.pg_sa_url_path
+                ),
+                "vault_role_name": self._env_alias_value(
+                    env, ("PG_VAULT_ROLE_NAME", "VAULT_ROLE_NAME", "VAULTROLENAME", "vaultRoleName"), self.pg_vault_role_name
+                ),
+                "vault_addr": self._env_value(env, "VAULT_ADDR", self.vault_addr),
+                "vault_namespace": self._env_value(env, "VAULT_NAMESPACE", self.vault_namespace),
+                "vault_auth_mount": self._env_value(env, "VAULT_AUTH_MOUNT", self.vault_auth_mount),
+                "vault_k8s_jwt_path": self._env_value(env, "VAULT_K8S_JWT_PATH", self.vault_k8s_jwt_path),
+                "vault_ca_cert": self._env_value(env, "VAULT_CA_CERT", self.vault_ca_cert),
+                "vault_verify_ssl": self._as_bool(
+                    self._env_value(env, "VAULT_VERIFY_SSL", self.vault_verify_ssl)
+                ),
+                # Static credentials remain a backward-compatible LOCAL/non-Vault fallback.
                 "user": self._env_value(env, "POSTGRES_USER", self.postgres_user),
                 "password": self._env_value(env, "POSTGRES_PASSWORD", self.postgres_password),
                 "sslmode": self._env_value(env, "POSTGRES_SSLMODE", self.postgres_sslmode),
                 "enabled": self._as_bool(self._env_value(env, "ENABLE_POSTGRES", self.enable_postgres)),
+                "auth_mode": "SA_URL_VAULT" if str(self._env_alias_value(
+                    env, ("PG_SA_URL_PATH", "SA_URL_PATH", "SA_URLPATH", "SaURLPath"), self.pg_sa_url_path
+                ) or "").strip() else "STATIC_CREDENTIALS",
             }
         return {
             "environment": env,
@@ -482,9 +554,240 @@ class Settings(BaseSettings):
             "enabled": self._as_bool(self._env_value(env, "ENABLE_SQLSERVER", self.enable_sqlserver)),
         }
 
+    @staticmethod
+    def _extract_sa_url_payload(payload: str) -> str:
+        """Extract a PostgreSQL URL from a Vault-agent/CSI rendered secret payload.
+
+        The rendered file may contain the URL directly or a small JSON/YAML mapping.
+        No username/password fields are exposed back to application configuration.
+        """
+        text_value = str(payload or "").strip()
+        if not text_value:
+            raise RuntimeError("SaURLPath resolved to an empty value.")
+        if text_value.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+            return text_value
+
+        try:
+            document = json.loads(text_value)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                document = yaml.safe_load(text_value)
+            except yaml.YAMLError:
+                document = None
+
+        preferred = {
+            "SAURL", "SA_URL", "URL", "URI", "DATABASE_URL", "POSTGRES_URL",
+            "CONNECTION_URL", "CONNECTION_URI", "DSN", "VALUE",
+        }
+
+        def find(node: Any) -> str | None:
+            if isinstance(node, dict):
+                # Prefer well-known keys before recursively traversing metadata wrappers.
+                for key, value in node.items():
+                    if _normalise_key(key) in preferred and isinstance(value, str):
+                        candidate = value.strip()
+                        if candidate.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+                            return candidate
+                for value in node.values():
+                    found = find(value)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for value in node:
+                    found = find(value)
+                    if found:
+                        return found
+            elif isinstance(node, str):
+                candidate = node.strip()
+                if candidate.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+                    return candidate
+            return None
+
+        result = find(document)
+        if not result:
+            raise RuntimeError(
+                "SaURLPath did not contain a PostgreSQL URL. Expected a direct postgresql:// URL "
+                "or a rendered JSON/YAML secret containing url/uri/database_url/connection_url/dsn."
+            )
+        return result
+
+    @staticmethod
+    def _extract_sa_credentials_payload(payload: str) -> tuple[str, str] | None:
+        """Extract dynamic username/password returned by a Vault database credential path.
+
+        This is not static application configuration: credentials are obtained at runtime from
+        SaURLPath and immediately placed into the SQLAlchemy URL. They are never copied into
+        environment variables or exposed through the API.
+        """
+        text_value = str(payload or "").strip()
+        if not text_value:
+            return None
+        try:
+            document = json.loads(text_value)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                document = yaml.safe_load(text_value)
+            except yaml.YAMLError:
+                return None
+
+        def find(node: Any) -> tuple[str, str] | None:
+            if isinstance(node, dict):
+                normalised = {_normalise_key(key): value for key, value in node.items()}
+                user = normalised.get("USERNAME", normalised.get("USER"))
+                password = normalised.get("PASSWORD", normalised.get("PASS"))
+                if isinstance(user, str) and isinstance(password, str) and user.strip() and password:
+                    return user.strip(), password
+                for value in node.values():
+                    found = find(value)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for value in node:
+                    found = find(value)
+                    if found:
+                        return found
+            return None
+
+        return find(document)
+
+    def _postgres_url_from_sa_payload(self, payload: str, cfg: dict[str, Any]) -> URL:
+        """Resolve either a full SA URL or runtime Vault database credentials."""
+        try:
+            url_value = self._extract_sa_url_payload(payload)
+        except RuntimeError:
+            credentials = self._extract_sa_credentials_payload(payload)
+            if not credentials:
+                raise
+            username, password = credentials
+            return URL.create(
+                "postgresql+psycopg",
+                username=username,
+                password=password,
+                host=str(cfg.get("host") or ""),
+                port=int(cfg.get("port") or 5432),
+                database=str(cfg.get("database") or ""),
+                query={"sslmode": str(cfg.get("sslmode") or "prefer")},
+            )
+        return self._normalise_postgres_sa_url(url_value, str(cfg.get("sslmode") or ""))
+
+    @staticmethod
+    def _normalise_postgres_sa_url(value: str, sslmode: str) -> URL:
+        raw = value.strip()
+        if raw.startswith("postgres://"):
+            raw = "postgresql://" + raw[len("postgres://"):]
+        if raw.startswith("postgresql://"):
+            raw = "postgresql+psycopg://" + raw[len("postgresql://"):]
+        url = make_url(raw)
+        if not url.drivername.startswith("postgresql"):
+            raise RuntimeError("SaURLPath must resolve to a PostgreSQL connection URL.")
+        if url.drivername != "postgresql+psycopg":
+            url = url.set(drivername="postgresql+psycopg")
+        query = dict(url.query)
+        if sslmode and "sslmode" not in query:
+            query["sslmode"] = str(sslmode)
+            url = url.set(query=query)
+        return url
+
+    def _vault_headers(self, cfg: dict[str, Any]) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        namespace = str(cfg.get("vault_namespace") or "").strip()
+        if namespace:
+            headers["X-Vault-Namespace"] = namespace
+        return headers
+
+    def _vault_token(self, cfg: dict[str, Any]) -> str:
+        # An injected VAULT_TOKEN is supported, but is not required. In Kubernetes,
+        # vaultRoleName is used with the pod service-account JWT by default.
+        token = os.getenv("VAULT_TOKEN", "").strip()
+        if token:
+            return token
+        role = str(cfg.get("vault_role_name") or "").strip()
+        if not role:
+            raise RuntimeError(
+                "vaultRoleName is required when SaURLPath is a Vault secret path and VAULT_TOKEN is not injected."
+            )
+        jwt_path = Path(str(cfg.get("vault_k8s_jwt_path") or "/var/run/secrets/kubernetes.io/serviceaccount/token"))
+        try:
+            jwt = jwt_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError(f"Unable to read Kubernetes service-account token from {jwt_path}.") from exc
+        if not jwt:
+            raise RuntimeError(f"Kubernetes service-account token is empty at {jwt_path}.")
+
+        vault_addr = str(cfg.get("vault_addr") or "").rstrip("/")
+        if not vault_addr:
+            raise RuntimeError("VAULT_ADDR is required to resolve SaURLPath through Vault.")
+        auth_mount = str(cfg.get("vault_auth_mount") or "kubernetes").strip("/")
+        verify: bool | str = bool(cfg.get("vault_verify_ssl", True))
+        if cfg.get("vault_ca_cert"):
+            verify = str(cfg["vault_ca_cert"])
+        response = requests.post(
+            f"{vault_addr}/v1/auth/{auth_mount}/login",
+            json={"role": role, "jwt": jwt},
+            headers=self._vault_headers(cfg),
+            timeout=max(1, min(int(self.db_connect_timeout_seconds), 15)),
+            verify=verify,
+        )
+        response.raise_for_status()
+        token = str((response.json().get("auth") or {}).get("client_token") or "").strip()
+        if not token:
+            raise RuntimeError("Vault Kubernetes login succeeded but returned no client token.")
+        return token
+
+    def _resolve_postgres_sa_url(self, cfg: dict[str, Any]) -> URL:
+        """Resolve SaURLPath from direct URL, mounted secret file, or HashiCorp Vault."""
+        source = str(cfg.get("sa_url_path") or "").strip()
+        if not source:
+            raise RuntimeError("SaURLPath is not configured.")
+
+        # Direct URL is useful for platform injection/tests and still avoids separate user/password settings.
+        if source.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+            return self._normalise_postgres_sa_url(source, str(cfg.get("sslmode") or ""))
+
+        file_source = source[7:] if source.startswith("file://") else source
+        file_path = Path(file_source)
+        if file_path.is_file():
+            try:
+                payload = file_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(f"Unable to read SaURLPath file {file_path}.") from exc
+            return self._postgres_url_from_sa_payload(payload, cfg)
+
+        # Otherwise treat SaURLPath as a Vault secret API path. This supports both
+        # Vault KV v1 and KV v2 response envelopes and Kubernetes-role authentication.
+        vault_addr = str(cfg.get("vault_addr") or "").rstrip("/")
+        if not vault_addr:
+            raise RuntimeError(
+                "SaURLPath is neither a readable mounted file nor a PostgreSQL URL, and VAULT_ADDR is not configured."
+            )
+        token = self._vault_token(cfg)
+        secret_path = source
+        if secret_path.startswith(vault_addr):
+            secret_url = secret_path
+        else:
+            secret_path = secret_path.lstrip("/")
+            if secret_path.startswith("v1/"):
+                secret_path = secret_path[3:]
+            secret_url = f"{vault_addr}/v1/{secret_path}"
+        headers = self._vault_headers(cfg)
+        headers["X-Vault-Token"] = token
+        verify: bool | str = bool(cfg.get("vault_verify_ssl", True))
+        if cfg.get("vault_ca_cert"):
+            verify = str(cfg["vault_ca_cert"])
+        response = requests.get(
+            secret_url,
+            headers=headers,
+            timeout=max(1, min(int(self.db_connect_timeout_seconds), 15)),
+            verify=verify,
+        )
+        response.raise_for_status()
+        return self._postgres_url_from_sa_payload(json.dumps(response.json()), cfg)
+
     def sqlalchemy_url(self, environment: str | None = None, db_type: str | None = None):
         cfg = self.database_config(environment, db_type)
         if cfg["db_type"] == "POSTGRES":
+            if str(cfg.get("sa_url_path") or "").strip():
+                return self._resolve_postgres_sa_url(cfg)
             return URL.create(
                 "postgresql+psycopg",
                 username=cfg["user"],

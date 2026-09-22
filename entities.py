@@ -32,8 +32,8 @@ class RawAttribute(Base, AuditColumns):
     prj_id: Mapped[str] = mapped_column(String(80), nullable=False)
     prj_attribute_name: Mapped[str] = mapped_column(String(500), nullable=False)
     prj_physical_attribute_name: Mapped[str] = mapped_column(String(500), nullable=False)
-    section: Mapped[str] = mapped_column(String(255), nullable=False)
-    sub_section: Mapped[str] = mapped_column(String(255), nullable=False)
+    section: Mapped[str] = mapped_column(String(255), nullable=False, default="N/A")
+    sub_section: Mapped[str] = mapped_column(String(255), nullable=False, default="N/A")
     data_type: Mapped[str | None] = mapped_column(String(100))
     calculated_or_reported: Mapped[str] = mapped_column(String(50), nullable=False)
     calculation_logic: Mapped[str] = mapped_column(Text, nullable=False, default="NA")
@@ -56,7 +56,7 @@ class PortfolioReference(Base, AuditColumns):
     portfolio_name: Mapped[str] = mapped_column(String(120), nullable=False)
     sector_name: Mapped[str] = mapped_column(String(120), nullable=False)
     sub_sector: Mapped[str | None] = mapped_column(String(120))
-    remark: Mapped[str | None] = mapped_column(String(500))
+    remarks: Mapped[str | None] = mapped_column(String(500))
 
 
 class PostgresPortfolioReference(Base, AuditColumns):
@@ -75,7 +75,30 @@ class PostgresPortfolioReference(Base, AuditColumns):
     portfolio_name: Mapped[str] = mapped_column(String(120), nullable=False)
     sector_name: Mapped[str] = mapped_column(String(120), nullable=False)
     sub_sector: Mapped[str | None] = mapped_column(String(120))
-    remark: Mapped[str | None] = mapped_column(String(500))
+    remarks: Mapped[str | None] = mapped_column(String(500))
+
+
+class DataSource(Base):
+    """Compatibility ORM view of the external read-only data-source reference.
+
+    Runtime source lookups intentionally continue to use reflected tables in the
+    repository because SQL Server installations may use legacy table/identifier
+    variants.  This model exists so callers/tests can import a stable entity name
+    without changing that runtime lookup behaviour.
+    """
+
+    __tablename__ = "prj_data_sources"
+    __table_args__ = {"schema": "dbo", "info": {"read_only": True}}
+
+    source_code: Mapped[str] = mapped_column(String(50), primary_key=True)
+    source_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+# Backward-compatible import names used by existing/legacy tests and callers.
+# Keep a single mapped class so SQLAlchemy metadata contains the table only once.
+Datasource = DataSource
+Datasources = DataSource
+DataSources = DataSource
 
 
 class StagingAttributeMaster(Base, AuditColumns):
@@ -137,8 +160,8 @@ class StagingAttributeDisplay(Base, ChangeColumns):
         String(80), ForeignKey("stg.prj_attribute_master_new_test.prj_id"), nullable=False
     )
     display_name: Mapped[str | None] = mapped_column(String(500))
-    section: Mapped[str] = mapped_column(String(255), nullable=False)
-    subsection: Mapped[str] = mapped_column(String(255), nullable=False)
+    section: Mapped[str] = mapped_column(String(255), nullable=False, default="N/A")
+    subsection: Mapped[str] = mapped_column(String(255), nullable=False, default="N/A")
 
     # Existing scope-specific fields are retained here so prior functionality is
     # not lost by the business/display split.
@@ -208,8 +231,8 @@ class AttributeDisplay(Base, ChangeColumns):
         String(80), ForeignKey("dbo.prj_attribute_master_new_test.prj_id"), nullable=False
     )
     display_name: Mapped[str | None] = mapped_column(String(500))
-    section: Mapped[str] = mapped_column(String(255), nullable=False)
-    subsection: Mapped[str] = mapped_column(String(255), nullable=False)
+    section: Mapped[str] = mapped_column(String(255), nullable=False, default="N/A")
+    subsection: Mapped[str] = mapped_column(String(255), nullable=False, default="N/A")
 
     prj_attribute_definition: Mapped[str | None] = mapped_column(Text)
     prj_attribute_description: Mapped[str | None] = mapped_column(Text)
@@ -232,3 +255,9 @@ class AuditTable(Base):
     source_operation: Mapped[str | None] = mapped_column(String(100))
     performed_by: Mapped[str] = mapped_column(String(128), nullable=False)
     performed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+# Backward-compatible audit entity names.  The canonical runtime model remains
+# AuditTable; aliases avoid duplicate SQLAlchemy table mappings.
+AuditLog = AuditTable
+AuditLogs = AuditTable
